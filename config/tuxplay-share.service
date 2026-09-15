@@ -1,0 +1,14 @@
+[Unit]
+Description=Hold the HomePod pair only while something is playing
+After=pipewire.service
+Wants=pipewire.service
+PartOf=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tuxplay-share
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

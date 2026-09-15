@@ -1,0 +1,12 @@
+[Unit]
+Description=owntone-mini - FIFO to AirPlay 2 bridge (HomePod stereo pair)
+After=network-online.target avahi-daemon.service
+Wants=network-online.target avahi-daemon.service
+
+[Service]
+ExecStart=/usr/local/sbin/owntone-mini -f -c /etc/owntone-settings.json
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

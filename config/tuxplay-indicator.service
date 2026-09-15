@@ -1,0 +1,14 @@
+[Unit]
+Description=Tuxplay top bar indicator
+After=graphical-session.target tuxplay-ui.service
+PartOf=graphical-session.target
+Wants=tuxplay-ui.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tuxplay-indicator
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

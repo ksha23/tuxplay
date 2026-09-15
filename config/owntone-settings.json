@@ -1,0 +1,26 @@
+{
+  "uid": "CHANGEME",
+  "server_name": "linux-airplay",
+  "loglevel": 3,
+  "logfile": "/var/log/owntone-mini.log",
+  "pipe_path": "/var/lib/owntone-mini/pipewire",
+  "pipe_autostart": true,
+  "pipe_sample_rate": 44100,
+  "pipe_bits_per_sample": 16,
+  "resample_quality": "standard",
+  "ipv6": true,
+  "start_buffer_ms": 250,
+  "uncompressed_alac": true,
+  "device_removal_grace_period": 180,
+  "airplay_timing_port": 0,
+  "airplay_control_port": 0,
+  "trusted_networks": [
+    "lan"
+  ],
+  "airplay_devices": {},
+  "buffered_audio_enabled": true,
+  "buffered_encoder_budget": 0,
+  "pipe_fifo_bytes": 8192,
+  "input_latency_guard_ms": 150,
+  "input_latency_target_ms": 35
+}

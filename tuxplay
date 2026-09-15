@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+# tuxplay - AirPlay 2 speakers as Linux audio outputs.
+#
+#   delay   how long after you press play the sound arrives.
+#   sync    a correction that shifts the audio earlier or later against the
+#           picture, without changing what the sink advertises.
+#
+# Why those are separate operations:
+#
+# The sink tells clients how much latency it has, and players delay video by
+# that much. Tuning sync means changing it repeatedly while watching something,
+# so it moves the anchor instead: it shifts start_buffer_ms (buffered) or the
+# per-speaker offset (realtime), neither of which touches the PipeWire sink, so
+# clients never notice. The effect on what you see and hear is the same.
+#
+# The advertised figure used to be changeable only by rewriting
+# tunnel.latency.msec and restarting PipeWire, because module-pipe-tunnel read
+# it once at node creation. That corked every client stream (Firefox needed a
+# tab reload) and a partial restart could leave the graph feeding the pipe slow
+# enough to starve owntone. The patched module now also accepts the value on a
+# live node, so delay no longer restarts anything but owntone-mini.
+#
+# See set_advertised_live() for how that is done and why it is verified by
+# reading the value back rather than trusting the setter's exit status.
+set -euo pipefail
+
+SETTINGS=/etc/owntone-settings.json
+PWCONF="$HOME/.config/pipewire/pipewire.conf.d/60-tuxplay-sink.conf"
+CONF="$HOME/.config/tuxplay.conf"
+API=${TUXPLAY_API:-http://localhost:3689}
+
+# pw-cli and pw-dump find the daemon through XDG_RUNTIME_DIR. An interactive
+# login has it; a systemd unit, a cron job or an ssh command does not, and
+# without it every PipeWire call here fails silently and we would fall back to
+# restarting PipeWire for no reason.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+PW_NODE=tuxplay
+
+# Measured on this path, not guessed: PipeWire's graph quantum (~21 ms at a
+# 1024-frame quantum) plus owntone's input buffer (~43 ms, held there by the
+# latency guard). See the "[stats] latency" line in owntone-mini's journal.
+TRANSIT_DEFAULT=65
+
+BASE_MS=250
+SYNC_MS=0
+# Explicit if, not `[ -f ... ] && .`: under `set -e` the latter exits when the
+# file does not exist yet, which is exactly the first-run case.
+if [ -f "$CONF" ]; then
+  . "$CONF"
+fi
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+save() { printf 'BASE_MS=%s\nSYNC_MS=%s\n' "$1" "$2" > "$CONF"; }
+
+set_anchor() {  # $1 = ms
+  sudo python3 - "$SETTINGS" "$1" <<'PY'
+import json, sys
+path, ms = sys.argv[1], int(sys.argv[2])
+c = json.load(open(path))
+c['start_buffer_ms'] = ms
+json.dump(c, open(path, 'w'), indent=2)
+PY
+}
+
+set_advertised() {  # $1 = ms
+  python3 - "$PWCONF" "$1" <<'PY'
+import re, sys
+path, adv = sys.argv[1], sys.argv[2]
+s = open(path).read()
+# Count the substitutions rather than comparing the text. Writing the value it
+# already holds is a no-op on the string, and testing "did the text change"
+# reported that as "not found" and, under set -e, aborted the whole command -
+# which broke exactly the case where the live and configured values have
+# drifted apart and you are re-running delay to put them back in step.
+s2, n = re.subn(r'(tunnel\.latency\.msec\s*=\s*)\d+', r'\g<1>' + adv, s, count=1)
+if n == 0:
+    sys.exit("error: tunnel.latency.msec not found in " + path)
+open(path, 'w').write(s2)
+PY
+}
+
+# ------------------------------------------------------- live advertised value
+#
+# What a client actually reads is the Input-direction Latency on the sink's
+# playback ports; PipeWire copies it across the link onto the client stream's
+# own port. The sink NODE's Latency param is all zeros and always has been, so
+# anything that reads the node to find this number will report nonsense.
+#
+# pw_stream (which is what module-pipe-tunnel builds the sink from) rejects a
+# remote set_param for every param id except Props - ProcessLatency and Latency
+# both come back -ENOTSUP - so Props is the only way in. The patched module
+# reads SPA_PROP_latencyOffsetNsec off a Props set as the absolute declared
+# latency in nanoseconds and re-publishes its latency params, which propagates
+# down the link to every attached client with no restart and no corked streams.
+
+pw_node_id() {
+  pw-dump 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.JSONDecoder().raw_decode(sys.stdin.read().lstrip())[0]
+except Exception:
+    sys.exit(1)
+for o in d:
+    if not str(o.get("type", "")).endswith("Node"):
+        continue
+    if ((o.get("info") or {}).get("props") or {}).get("node.name") == sys.argv[1]:
+        print(o["id"]); sys.exit(0)
+sys.exit(1)
+' "$PW_NODE"
+}
+
+# What the running sink advertises right now, in ms. Reads the ports, not the
+# node, for the reason above.
+read_live_advertised() {
+  pw-dump 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.JSONDecoder().raw_decode(sys.stdin.read().lstrip())[0]
+except Exception:
+    sys.exit(1)
+nid = [o["id"] for o in d
+       if str(o.get("type", "")).endswith("Node")
+       and ((o.get("info") or {}).get("props") or {}).get("node.name") == sys.argv[1]]
+if not nid:
+    sys.exit(1)
+for o in d:
+    if not str(o.get("type", "")).endswith("Port"):
+        continue
+    info = o.get("info") or {}
+    p = info.get("props") or {}
+    if p.get("node.id") != nid[0] or p.get("port.direction") != "in":
+        continue
+    for e in (info.get("params") or {}).get("Latency") or []:
+        if e.get("direction") == "Input":
+            print(int(round(e.get("minNs", 0) / 1e6))); sys.exit(0)
+sys.exit(1)
+' "$PW_NODE"
+}
+
+# Returns non-zero if the value did not take, so the caller can fall back.
+set_advertised_live() {  # $1 = ms
+  local ms=$1 id got
+  command -v pw-cli >/dev/null 2>&1 || return 1
+  command -v pw-dump >/dev/null 2>&1 || return 1
+  id=$(pw_node_id) || return 1
+  [ -n "$id" ] || return 1
+
+  pw-cli s "$id" Props "{ latencyOffsetNsec = $(( ms * 1000000 )) }" >/dev/null 2>&1
+
+  # pw-cli set-param is fire-and-forget: it prints the POD it sent and exits 0
+  # even when the daemon rejects the param, which it reports only in its own
+  # log. So its exit status proves nothing. Read the value back off the sink
+  # and require it to match, which is also what catches an unpatched module.
+  got=$(read_live_advertised) || return 1
+  [ "$got" = "$ms" ]
+}
+
+# The fallback path. Restart the three together: pipewire alone leaves
+# pipewire-pulse and wireplumber holding links to a sink that no longer exists,
+# which is what left the graph feeding the pipe ~6% slow and starved owntone.
+# Then the units that keep the sink open, then owntone.
+restart_pipewire_stack() {
+  systemctl --user restart pipewire pipewire-pulse wireplumber
+  sleep 5
+  systemctl --user restart tuxplay-share tuxplay-volume 2>/dev/null || true
+  sleep 2
+}
+
+# Which transport owntone is actually running. The two have completely
+# different latency knobs: buffered renders on a SETRATEANCHORTIME anchor
+# (start_buffer_ms), realtime negotiates latencyMin at SETUP and start_buffer_ms
+# is not in the path at all. Setting the wrong one is silent - nothing errors,
+# the latency just does not move.
+DROPIN=/etc/systemd/system/owntone-mini.service.d/transport.conf
+transport() {
+  # Ask owntone what it is actually running, do not infer it from a drop-in.
+  # Realtime is the compiled default now, so the absence of a drop-in means
+  # realtime, not buffered - an earlier version of this function read it the
+  # other way and silently wrote start_buffer_ms, which does nothing on the
+  # realtime path.
+  local line
+  line=$(journalctl -u owntone-mini -b --no-pager 2>/dev/null \
+         | grep -oE 'Transport: (realtime|buffered)' | tail -1)
+  case "$line" in
+    *realtime) echo realtime ;;
+    *buffered) echo buffered ;;
+    *)
+      # No log line (owntone not started this boot): fall back to the drop-in,
+      # then to the compiled default.
+      if [ -f "$DROPIN" ] && grep -qi 'TUXPLAY_TRANSPORT=buffered' "$DROPIN" 2>/dev/null; then
+        echo buffered
+      else
+        echo realtime
+      fi ;;
+  esac
+}
+
+set_realtime_latency() {  # $1 = ms
+  sudo mkdir -p "$(dirname "$DROPIN")"
+  sudo tee "$DROPIN" >/dev/null <<EOF
+[Service]
+Environment=TUXPLAY_TRANSPORT=realtime
+Environment=TUXPLAY_REALTIME_LATENCY_MS=$1
+EOF
+  sudo systemctl daemon-reload
+}
+
+get_realtime_latency() {
+  grep -oE 'TUXPLAY_REALTIME_LATENCY_MS=[0-9]+' "$DROPIN" 2>/dev/null | grep -oE '[0-9]+$'
+}
+
+# Per-speaker offset, in ms. Works on BOTH transports - buffered shifts the
+# anchor time, realtime shifts the RTP timestamp - and applies live, with no
+# restart, which is what makes it usable for tuning by ear.
+set_offset() {  # $1 = signed ms
+  local ids id
+  ids=$(curl -s --max-time 5 "$API/api/outputs" 2>/dev/null | python3 -c "
+import json,sys
+for o in json.load(sys.stdin).get('outputs',[]):
+    if o.get('selected'): print(o['id'])
+")
+  [ -n "$ids" ] || return 1
+  for id in $ids; do
+    curl -s --max-time 8 -X PUT -H 'Content-Type: application/json' \
+      -d "{\"offset_ms\":$1}" "$API/api/outputs/$id" >/dev/null 2>&1
+  done
+}
+
+get_anchor()     { sudo python3 -c "import json;print(json.load(open('$SETTINGS'))['start_buffer_ms'])"; }
+get_advertised() { grep -oE 'tunnel\.latency\.msec *= *[0-9]+' "$PWCONF" | grep -oE '[0-9]+$'; }
+
+apply_sync() {  # $1 = new signed sync offset
+  local new=$1 anchor=$(( BASE_MS + $1 ))
+
+  # On realtime the anchor does not exist; shift the per-speaker offset instead.
+  # Applies immediately with no restart.
+  if [ "$(transport)" = realtime ]; then
+    set_offset "$new" || die "no speakers selected, so there is nothing to offset"
+    save "$BASE_MS" "$new"
+    printf 'sync %+d -> %+d ms (realtime: per-speaker offset, applied live)\n' "$SYNC_MS" "$new"
+    return 0
+  fi
+
+  [ "$anchor" -ge 150 ] && [ "$anchor" -le 3500 ] \
+    || die "that would put the anchor at ${anchor} ms; it must stay between 150 and 3500"
+  set_anchor "$anchor"
+  save "$BASE_MS" "$new"
+  printf 'sync %+d -> %+d ms (anchor %d ms)\n' "$SYNC_MS" "$new" "$anchor"
+  sudo systemctl restart owntone-mini
+  echo "done - PipeWire untouched, so nothing playing was disturbed."
+  echo "give the pair ~15s to re-establish, then listen again."
+}
+
+apply_delay() {  # $1 = ms
+  local MS=$1 adv
+  [ "$MS" -ge 150 ] && [ "$MS" -le 3500 ] || die "delay must be 150-3500 ms"
+  adv=$(( MS + TRANSIT_DEFAULT ))
+
+  # Realtime: latencyMin is the delay you hear, not start_buffer_ms. Advertise
+  # the same total either way, so what the desktop is told stays true.
+  if [ "$(transport)" = realtime ]; then
+    echo "delay ${MS} ms (realtime latencyMin), advertising ${adv} ms, sync reset to 0"
+    set_realtime_latency "$MS"
+    set_offset 0 2>/dev/null || true
+  else
+    echo "delay ${MS} ms, advertising ${adv} ms, sync correction reset to 0"
+    set_anchor "$MS"
+  fi
+
+  # Write the config either way, so the value survives a PipeWire restart, and
+  # push it onto the running sink so it takes effect now. Both, not one: the
+  # file is what a fresh node reads, the live set is what attached clients see.
+  set_advertised "$adv"
+  save "$MS" 0
+
+  if set_advertised_live "$adv"; then
+    sudo systemctl restart owntone-mini
+    echo "advertised ${adv} ms applied live - PipeWire was not restarted, so"
+    echo "nothing playing was corked and Firefox needs no tab reload."
+    echo "done - give it ~15s for the speakers, then: tuxplay status"
+    return 0
+  fi
+
+  echo "could not set the advertised figure on the running sink (is the patched"
+  echo "pipe-tunnel module installed?) - falling back to restarting PipeWire."
+  echo "anything playing may need a nudge to resume."
+  restart_pipewire_stack
+  sudo systemctl restart owntone-mini
+  echo "done - give it ~20s, then: tuxplay status"
+}
+
+usage() {
+  cat >&2 <<EOF
+usage:
+  tuxplay delay <ms>        set the delay you hear (150-3500)
+  tuxplay sync earlier <ms> pull the sound IN   - use when VIDEO IS AHEAD
+  tuxplay sync later <ms>   push the sound BACK - use when AUDIO IS AHEAD
+  tuxplay sync reset        back to no correction
+  tuxplay hold on|off       keep the connection open, or drop it when idle
+  tuxplay status            show what is set now
+
+If picture and sound disagree, use sync - it does not disturb playback:
+
+  sound arrives late  (video ahead)  ->  tuxplay sync earlier 20
+  sound arrives early (audio ahead)  ->  tuxplay sync later 20
+
+Nudge 20-30 ms at a time; below about 20 ms nobody can see the difference.
+
+Changing <ms> applies the new advertised figure to the running sink and
+restarts only owntone-mini, so the speakers drop out for a few seconds but
+nothing on the desktop is corked. It falls back to restarting PipeWire, and
+says so, if the sink will not take the value live.
+EOF
+  exit 2
+}
+
+[ $# -ge 1 ] || usage
+
+case "$1" in
+  status)
+    adv=$(get_advertised); tp=$(transport); anchor=
+    if [ "$tp" = realtime ]; then
+      # start_buffer_ms is the buffered anchor lead; it is not in this path.
+      rt=$(journalctl -u owntone-mini -b --no-pager 2>/dev/null \
+           | grep -oE 'Realtime latencyMin: [0-9]+' | tail -1 | grep -oE '[0-9]+$')
+      printf 'transport:             realtime\n'
+      printf 'delay you hear:        %s ms (latencyMin)\n' "${rt:-unknown}"
+    else
+      anchor=$(get_anchor)
+      printf 'transport:             buffered\n'
+      printf 'delay you hear:        %s ms (start_buffer_ms)\n' "$anchor"
+    fi
+    printf 'sync correction:       %+d ms\n' "$SYNC_MS"
+    printf 'advertised to clients: %s ms (configured)\n' "$adv"
+    # The configured figure is what a freshly created sink reads; the live one
+    # is what attached clients are actually being told. They differ if someone
+    # edited the conf by hand, so show both rather than imply the file is truth.
+    live=$(read_live_advertised 2>/dev/null) || live=
+    if [ -z "$live" ]; then
+      printf 'live on the sink:      unavailable (PipeWire not reachable)\n'
+    elif [ "$live" = "$adv" ]; then
+      printf 'live on the sink:      %s ms (matches)\n' "$live"
+    else
+      printf 'live on the sink:      %s ms - DOES NOT MATCH the configured %s ms;\n' "$live" "$adv"
+      printf '                       run "tuxplay delay %s" to put them back in step\n' "$BASE_MS"
+    fi
+    h=0; [ -f "$HOME/.config/tuxplay-hold.conf" ] && . "$HOME/.config/tuxplay-hold.conf" 2>/dev/null
+    if [ "${HOLD:-0}" = 1 ]; then
+      printf 'hold:                  ON  (connection kept; dark when idle, immediate start)\n'
+    else
+      printf 'hold:                  off (connection dropped when idle; ~1.4s to start)\n'
+    fi
+    echo
+    # Only meaningful on the buffered path - realtime has no anchor, and the
+    # unguarded test used to abort status with "anchor: unbound variable".
+    if [ -n "$anchor" ] && [ "$anchor" -ne "$(( BASE_MS + SYNC_MS ))" ]; then
+      echo "note: the anchor does not match BASE_MS+SYNC_MS in $CONF;"
+      echo "      run 'tuxplay $anchor' to resync the bookkeeping."
+    fi
+    ;;
+
+  sync)
+    [ $# -ge 2 ] || usage
+    case "$2" in
+      reset)   apply_sync 0 ;;
+      earlier) [ $# -eq 3 ] || usage
+               case "$3" in ''|*[!0-9]*) usage;; esac
+               apply_sync $(( SYNC_MS - $3 )) ;;
+      later)   [ $# -eq 3 ] || usage
+               case "$3" in ''|*[!0-9]*) usage;; esac
+               apply_sync $(( SYNC_MS + $3 )) ;;
+      *)       usage ;;
+    esac
+    ;;
+
+  hold)
+    [ $# -eq 2 ] || usage
+    case "$2" in
+      on)  printf 'HOLD=1\n' > "$HOME/.config/tuxplay-hold.conf"
+           echo "hold ON - the connection stays open, so playback starts immediately."
+           echo "the speakers still go dark when nothing is playing, and another device"
+           echo "can take them whenever it asks." ;;
+      off) printf 'HOLD=0\n' > "$HOME/.config/tuxplay-hold.conf"
+           echo "hold OFF - the connection is dropped a couple of seconds after audio stops."
+           echo "starting playback then has to set the session up again, about 1.4s." ;;
+      *)   usage ;;
+    esac
+    ;;
+
+  delay)
+    [ $# -eq 2 ] || usage
+    case "$2" in ''|*[!0-9]*) usage;; esac
+    apply_delay "$2"
+    ;;
+
+  # A bare number still works, since that is what this took before it grew
+  # subcommands.
+  ''|*[!0-9]*) usage ;;
+
+  *)
+    apply_delay "$1"
+    ;;
+esac

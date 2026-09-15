@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""tuxplay-volume - keep the desktop slider and the speakers' volume in sync.
+
+Without this there are two volume controls that know nothing about each other:
+
+  the sound panel slider  -> PipeWire multiplies the PCM by a gain
+  owntone's device volume -> the AirPlay volume the speakers actually run at
+
+Only the second reaches the speakers, and nothing in the desktop exposes it, so
+the top of the slider's travel is wherever owntone happens to be set. At 30
+that ceiling is
+
+    airplay_volume_from_pct(): -30 + (30 * 30)/100  =  -21 dB
+
+which is why the buttons on the speaker still have most of the range left when
+the desktop already reads 100%.
+
+A macOS sender has one control - its slider *is* the AirPlay volume. This
+reproduces that:
+
+  - the slider's gain is cancelled, so PipeWire stops attenuating
+  - the slider's value is sent to owntone, which sends SET_PARAMETER
+  - volume changed on the speaker itself is followed back into the slider
+
+Cancelling the gain is done with channelmix.min-volume, the floor the mixer
+clamps its volume to. Setting it to 1.0 means no slider position can attenuate,
+while channelVolumes is left alone so the slider still moves and still reports
+where it is. Measured on a pipe-tunnel sink writing to a FIFO:
+
+    slider 100%, min-volume 1.0     +0.0 dB
+    slider 20%,  min-volume 1.0     -0.0 dB
+    slider 60%,  min-volume 1.0     -0.0 dB
+    slider 10%,  min-volume 1.0     -0.0 dB
+
+Two other things look like the right lever and are not. channelmix.lock-volumes
+does not mean "show the value but do not apply it", it means "ignore volume
+changes" - an ALSA node can afford that because its slider lives on the device
+Route, and here it freezes the slider solid. Writing softVolumes directly does
+cancel the gain, but PipeWire recomputes it from channelVolumes on every change,
+so it has to be re-asserted continuously - and the gap between PipeWire resetting
+it and the daemon putting it back makes the gain audibly oscillate while the
+volume is moving.
+
+Doing the attenuation in the speaker also keeps the resolution: the pipe is
+S16LE, and -21 dB of digital gain throws away about three and a half of the
+sixteen bits before the speakers ever see the audio.
+
+Ordering is chosen so a crash can only ever leave things quieter: owntone is
+updated first and the gain cancelled second, so a daemon that dies midway
+leaves extra attenuation in place rather than extra volume. On exit the gain is
+handed back to the slider, so a stopped service leaves an ordinary control.
+"""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+SINK = os.environ.get("TUXPLAY_SINK", "tuxplay")
+API = os.environ.get("TUXPLAY_API", "http://localhost:3689")
+TICK = float(os.environ.get("TUXPLAY_VOLUME_TICK", "0.2"))
+# How often to ask owntone what the speakers are at. The slider is event driven;
+# this is only for volume changed on the speaker itself.
+OUTS_EVERY = float(os.environ.get("TUXPLAY_VOLUME_POLL", "1.0"))
+# owntone keeps reporting the old volume for a moment after we set it. A change
+# seen inside this window is our own echo, not the buttons on the speaker.
+ECHO_SEC = float(os.environ.get("TUXPLAY_VOLUME_ECHO", "2.0"))
+
+
+
+def log(msg):
+    print("%s tuxplay-volume: %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+
+
+def run(*args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return ""
+
+
+# --- PipeWire -------------------------------------------------------------
+
+def pw_find():
+    """Full scan for our sink. Only used when we have no node id."""
+    try:
+        data = json.loads(run("pw-dump") or "[]")
+    except ValueError:
+        return None
+    for n in data:
+        if n.get("info", {}).get("props", {}).get("node.name") == SINK:
+            return n.get("id")
+    return None
+
+
+def pw_state(node):
+    """Whether the clamp is in place, or None if the node is gone."""
+    try:
+        data = json.loads(run("pw-dump", str(node)) or "[]")
+    except ValueError:
+        return None
+    for n in data:
+        if n.get("id") != node:
+            continue
+        for p in n.get("info", {}).get("params", {}).get("Props", []):
+            if "channelVolumes" in p:
+                raw = p.get("params") or []
+                pairs = dict(zip(raw[::2], raw[1::2]))
+                return {"minvol": pairs.get("channelmix.min-volume")}
+    return None
+
+
+def pw_clamp(node, on):
+    """Pin the applied gain at unity, or hand it back to the slider.
+
+    channelmix.min-volume is the floor the mixer clamps its volume to. Setting
+    it to 1.0 means no slider position can attenuate, while channelVolumes is
+    left alone so the slider still moves and still reports where it is.
+    """
+    run("pw-cli", "s", str(node), "Props",
+        '{ params = [ "channelmix.min-volume", "%s" ] }' % ("1.0" if on else "0.0"))
+
+
+# --- the sink, as the desktop sees it -------------------------------------
+
+def sink_pct():
+    for tok in run("pactl", "get-sink-volume", SINK).split():
+        if tok.endswith("%"):
+            try:
+                return max(0, min(100, int(tok[:-1])))
+            except ValueError:
+                pass
+    return None
+
+
+def sink_set_pct(pct):
+    run("pactl", "set-sink-volume", SINK, "%d%%" % max(0, min(100, int(pct))))
+
+
+def sink_muted():
+    return "yes" in run("pactl", "get-sink-mute", SINK)
+
+
+# --- owntone ---------------------------------------------------------------
+
+def api_get(path):
+    try:
+        with urllib.request.urlopen(API + path, timeout=5) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def api_put(path, body):
+    req = urllib.request.Request(API + path, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"},
+                                 method="PUT")
+    try:
+        urllib.request.urlopen(req, timeout=8).read()
+        return True
+    except Exception:
+        return False
+
+
+def selected_outputs():
+    d = api_get("/api/outputs")
+    if not d:
+        return None
+    return [(o["id"], o["volume"]) for o in d.get("outputs", []) if o.get("selected")]
+
+
+class SinkWatch(threading.Thread):
+    """`pactl subscribe`, so a slider move is acted on at once. Polling for it
+    would make the desktop's volume keys feel broken."""
+
+    daemon = True
+
+    def __init__(self):
+        super().__init__()
+        self.bump = threading.Event()
+
+    def run(self):
+        while True:
+            try:
+                p = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE, text=True)
+                for line in p.stdout:
+                    if "sink" in line and "change" in line:
+                        self.bump.set()
+            except Exception:
+                pass
+            time.sleep(2)
+
+
+def main():
+    node = None
+    pushed = {}       # output id -> volume we last sent it
+    last_push = 0.0
+    last_pct = None
+    outs = []
+    next_outs = 0.0
+    known = None      # the selection we last saw
+    next_node = 0.0
+
+    watch = SinkWatch()
+    watch.start()
+
+    def cleanup(*_):
+        if node:
+            pw_clamp(node, False)
+            log("gain handed back to the slider")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    log("started - the slider is now the speakers' volume")
+
+    while True:
+        now = time.time()
+
+        # Checking the node exists is a pw-dump; it does not need doing at the
+        # rate the slider is polled.
+        if now >= next_node:
+            next_node = now + 2.0
+            st = pw_state(node) if node else None
+            if st is None:
+                found = pw_find()
+                if found != node:
+                    node, last_pct = found, None
+                    if node:
+                        log("sink is node %s" % node)
+                st = pw_state(node) if node else None
+            # Set once and left alone - writing it repeatedly is what made
+            # volume changes glitch. Only re-applied if it is actually gone,
+            # which happens when PipeWire rebuilds the node.
+            if node and st is not None and str(st.get("minvol")) != "1.0":
+                pw_clamp(node, True)
+        if not node:
+            time.sleep(TICK)
+            continue
+        if now >= next_outs or watch.bump.is_set():
+            got = selected_outputs()
+            if got is not None:
+                outs = got
+            next_outs = now + OUTS_EVERY
+
+        pct = sink_pct()
+        muted = sink_muted()
+        moved = watch.bump.is_set() or (pct is not None and pct != last_pct)
+        if moved:
+            watch.bump.clear()
+
+        # Newly selected speakers are at whatever the last sender left them at.
+        # Push the slider to them, otherwise picking a speaker would leave the
+        # two out of step until something happened to touch the slider.
+        ids = tuple(sorted(o for o, _ in outs))
+        if ids != known:
+            known = ids
+            pushed = {}
+            if ids:
+                moved = True
+
+        # 1. Send the slider to the speakers FIRST. If this process dies here,
+        #    the uncancelled gain below leaves things quieter, never louder.
+        if moved and outs:
+            want = 0 if muted else pct
+            if want is not None:
+                for oid, _ in outs:
+                    if pushed.get(oid) != want:
+                        api_put("/api/outputs/%s" % oid, {"volume": want})
+                        pushed[oid] = want
+                last_push = now
+        if pct is not None:
+            last_pct = pct
+
+        # 2. Volume changed on the speaker itself -> bring the slider to it.
+        if outs and now - last_push > ECHO_SEC and not muted:
+            for oid, vol in outs:
+                if pushed.get(oid) is not None and vol != pushed[oid]:
+                    log("speaker moved to %d%% - following" % vol)
+                    sink_set_pct(vol)
+                    last_pct = vol
+                    pushed = {o: vol for o, _ in outs}
+                    watch.bump.clear()
+                    break
+
+        # Speakers we have never pushed to: adopt their level so the follow
+        # branch has a baseline, without changing how loud anything is.
+        for oid, vol in outs:
+            pushed.setdefault(oid, vol)
+
+        time.sleep(TICK)
+
+
+if __name__ == "__main__":
+    main()

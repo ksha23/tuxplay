@@ -1,0 +1,13 @@
+[Unit]
+Description=Control panel for the HomePod pair output
+After=tuxplay-share.service
+Wants=tuxplay-share.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tuxplay-ui
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

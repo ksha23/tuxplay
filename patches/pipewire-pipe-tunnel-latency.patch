@@ -1,0 +1,215 @@
+--- src/modules/module-pipe-tunnel.c
++++ src/modules/module-pipe-tunnel.c
+@@ -27,6 +27,8 @@
+ #include <spa/pod/builder.h>
+ #include <spa/param/audio/format-utils.h>
+ #include <spa/param/latency-utils.h>
++#include <spa/param/props.h>
++#include <spa/pod/parser.h>
+ #include <spa/param/audio/raw.h>
+ 
+ #include <pipewire/impl.h>
+@@ -140,6 +142,7 @@
+ 			"( audio.channels=<number of channels> ) "		\
+ 			"( audio.position=<channel map> ) "			\
+ 			"( tunnel.mode=capture|playback|sink|source )"		\
++			"( tunnel.latency.msec=<downstream latency in ms> )"	\
+ 			"( tunnel.may-pause=<bool, if the stream can pause> )"	\
+ 			"( pipe.filename=<filename> )"				\
+ 			"( stream.props=<properties> ) "
+@@ -184,6 +187,7 @@
+ 	struct spa_hook stream_listener;
+ 	struct spa_audio_info_raw info;
+ 	uint32_t frame_size;
++	struct spa_process_latency_info process_latency;
+ 
+ 	unsigned int do_disconnect:1;
+ 	unsigned int driving:1;
+@@ -268,6 +272,8 @@
+ 	impl->stream = NULL;
+ }
+ 
++static void update_latency_params(struct impl *impl);
++
+ static void stream_state_changed(void *d, enum pw_stream_state old,
+ 		enum pw_stream_state state, const char *error)
+ {
+@@ -278,12 +284,19 @@
+ 		pw_impl_module_schedule_destroy(impl->module);
+ 		break;
+ 	case PW_STREAM_STATE_PAUSED:
++		/* Negotiation is done by the time the stream reaches PAUSED, and
++		 * the adapter has just recomputed (and zeroed) port latency. The
++		 * push from create_stream() lands before that and is lost, which
++		 * is why the sink reported "Latency: 0 usec" and no player ever
++		 * delayed video to match. Re-push here, where it sticks. */
++		update_latency_params(impl);
+ 		if (impl->direction == PW_DIRECTION_OUTPUT) {
+ 			pw_loop_update_io(impl->data_loop, impl->socket, impl->paused ? SPA_IO_IN : 0);
+ 			set_timeout(impl, 0);
+ 		}
+ 		break;
+ 	case PW_STREAM_STATE_STREAMING:
++		update_latency_params(impl);
+ 		if (impl->direction == PW_DIRECTION_OUTPUT) {
+ 			pw_loop_update_io(impl->data_loop, impl->socket, SPA_IO_IN);
+ 			impl->driving = pw_stream_is_driving(impl->stream);
+@@ -455,8 +468,50 @@
+ 	}
+ }
+ 
++/* Let the DECLARED latency be changed on a live sink, with no module reload.
++ *
++ * pw_stream accepts only SPA_PARAM_Props from a remote set_param - every other
++ * param id returns -ENOTSUP, including ProcessLatency and Latency themselves -
++ * and the adapter forwards a Props pod down to the follower untouched. So Props
++ * is the only door into a running node, and SPA_PROP_latencyOffsetNsec is the
++ * closest-matching standard key.
++ *
++ * The value is read as the ABSOLUTE declared latency in nanoseconds, not as an
++ * offset added to tunnel.latency.msec. That keeps the runtime value and the
++ * configured one in the same units and the same meaning, so a caller that
++ * writes the config file and sets this leaves one state behind, not two that
++ * later have to be reconciled.
++ *
++ * Zero and negative values are ignored deliberately. A session manager that
++ * restores properties onto this node could otherwise push 0 and silently undo
++ * the configured latency; requiring a positive number means the only way to
++ * move it is to ask for a real one.
++ */
++static void stream_param_changed(void *d, uint32_t id, const struct spa_pod *param)
++{
++	struct impl *impl = d;
++	int64_t ns = 0;
++
++	if (id != SPA_PARAM_Props || param == NULL)
++		return;
++
++	if (spa_pod_parse_object(param, SPA_TYPE_OBJECT_Props, NULL,
++			SPA_PROP_latencyOffsetNsec, SPA_POD_OPT_Long(&ns)) < 0)
++		return;
++
++	if (ns <= 0 || (uint64_t)ns == impl->process_latency.ns)
++		return;
++
++	pw_log_info("latency set at runtime: ns=%"PRIi64" (was %"PRIi64")",
++			ns, (int64_t)impl->process_latency.ns);
++
++	impl->process_latency.ns = ns;
++	update_latency_params(impl);
++}
++
+ static const struct pw_stream_events playback_stream_events = {
+ 	PW_VERSION_STREAM_EVENTS,
++	.param_changed = stream_param_changed,
+ 	.destroy = stream_destroy,
+ 	.state_changed = stream_state_changed,
+ 	.process = playback_stream_process
+@@ -464,17 +519,52 @@
+ 
+ static const struct pw_stream_events capture_stream_events = {
+ 	PW_VERSION_STREAM_EVENTS,
++	.param_changed = stream_param_changed,
+ 	.destroy = stream_destroy,
+ 	.io_changed = stream_io_changed,
+ 	.state_changed = stream_state_changed,
+ 	.process = capture_stream_process,
+ };
+ 
++
++/* Push the configured downstream latency onto the live stream. Passing these
++ * to pw_stream_connect() is not enough: the adapter recomputes port latency
++ * during negotiation and zeroes them. module-raop-sink updates params after
++ * the stream exists, so do the same. */
++static void update_latency_params(struct impl *impl)
++{
++	uint8_t buffer[1024];
++	struct spa_pod_builder b;
++	const struct spa_pod *params[3];
++	struct spa_latency_info in_latency, out_latency;
++	uint32_t n_params = 0;
++
++	if (impl->stream == NULL || impl->process_latency.ns <= 0)
++		return;
++
++	spa_pod_builder_init(&b, buffer, sizeof(buffer));
++
++	in_latency = SPA_LATENCY_INFO(SPA_DIRECTION_INPUT);
++	spa_process_latency_info_add(&impl->process_latency, &in_latency);
++
++	out_latency = SPA_LATENCY_INFO(SPA_DIRECTION_OUTPUT,
++			.min_ns = impl->process_latency.ns,
++			.max_ns = impl->process_latency.ns);
++
++	params[n_params++] = spa_latency_build(&b, SPA_PARAM_Latency, &in_latency);
++	params[n_params++] = spa_latency_build(&b, SPA_PARAM_Latency, &out_latency);
++	params[n_params++] = spa_process_latency_build(&b,
++			SPA_PARAM_ProcessLatency, &impl->process_latency);
++
++	pw_log_info("updating latency params: ns=%"PRIi64, (int64_t)impl->process_latency.ns);
++	pw_stream_update_params(impl->stream, params, n_params);
++}
++
+ static int create_stream(struct impl *impl)
+ {
+ 	int res;
+ 	uint32_t n_params;
+-	const struct spa_pod *params[1];
++	const struct spa_pod *params[8];
+ 	uint8_t buffer[1024];
+ 	struct spa_pod_builder b;
+ 
+@@ -499,6 +589,29 @@
+ 	params[n_params++] = spa_format_audio_raw_build(&b,
+ 			SPA_PARAM_EnumFormat, &impl->info);
+ 
++	/* Declare downstream latency so applications can compensate (A/V sync).
++	 * A pipe sink cannot know what consumes the far end of the FIFO, so the
++	 * value is supplied by configuration. Mirrors module-raop-sink. */
++	pw_log_info("connect: process_latency.ns=%"PRIi64, (int64_t)impl->process_latency.ns);
++	if (impl->process_latency.ns > 0) {
++		struct spa_latency_info in_latency, out_latency;
++
++		/* Clients read the OUTPUT-direction latency on a sink's input port
++		 * to learn how long until audio is actually heard; that is the one
++		 * that drives A/V sync. Emit both directions like module-raop-sink. */
++		in_latency = SPA_LATENCY_INFO(SPA_DIRECTION_INPUT);
++		spa_process_latency_info_add(&impl->process_latency, &in_latency);
++
++		out_latency = SPA_LATENCY_INFO(SPA_DIRECTION_OUTPUT,
++				.min_ns = impl->process_latency.ns,
++				.max_ns = impl->process_latency.ns);
++
++		params[n_params++] = spa_latency_build(&b, SPA_PARAM_Latency, &in_latency);
++		params[n_params++] = spa_latency_build(&b, SPA_PARAM_Latency, &out_latency);
++		params[n_params++] = spa_process_latency_build(&b,
++				SPA_PARAM_ProcessLatency, &impl->process_latency);
++	}
++
+ 	impl->paused = false;
+ 
+ 	if ((res = pw_stream_connect(impl->stream,
+@@ -510,6 +623,8 @@
+ 			params, n_params)) < 0)
+ 		return res;
+ 
++	update_latency_params(impl);
++
+ 	return 0;
+ }
+ 
+@@ -916,6 +1031,14 @@
+ 		res = -EINVAL;
+ 		goto error;
+ 	}
++	if ((str = pw_properties_get(props, "tunnel.latency.msec")) != NULL) {
++		float latency_msec = 0.0f;
++		if (spa_atof(str, &latency_msec) && latency_msec > 0.0f)
++			impl->process_latency.ns = (int64_t)(latency_msec * SPA_NSEC_PER_MSEC);
++		pw_log_info("tunnel.latency.msec='%s' parsed=%f ns=%"PRIi64,
++				str, latency_msec, (int64_t)impl->process_latency.ns);
++	}
++
+ 	if ((str = pw_properties_get(props, "tunnel.may-pause")) != NULL)
+ 		impl->may_pause = spa_atob(str);
+ 

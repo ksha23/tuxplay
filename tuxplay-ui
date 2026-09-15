@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""tuxplay-ui - a small control panel for the HomePod pair output.
+
+Serves a single page on the LAN so the pair can be controlled without
+remembering command names, and from a phone or another machine rather than only
+from a terminal on the box itself. Everything it does is also doable with
+tuxplay and systemctl; this is the same controls with the reasoning
+written next to them.
+
+Python standard library only, deliberately: this runs on a machine whose audio
+stack we have already made complicated enough, and it should not add another
+thing that can fail to install.
+"""
+
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BIND = os.environ.get("TUXPLAY_UI_BIND", "0.0.0.0")
+PORT = int(os.environ.get("TUXPLAY_UI_PORT", "8730"))
+API = os.environ.get("TUXPLAY_API", "http://localhost:3689")
+HOLD_CONF = os.path.expanduser("~/.config/tuxplay-hold.conf")
+# The AirPlay control connection owntone holds to each connected speaker.
+RTSP_PORT = int(os.environ.get("TUXPLAY_RTSP_PORT", "7000"))
+
+
+def run(cmd, timeout=25):
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return 1, "", "timed out"
+
+
+def state():
+    # Only established connections: sockets still closing count as nothing.
+    # (Not filtered by process: owntone's socket owners are hidden from ss.)
+    rc, out, _ = run("ss -tnH state established '( dport = :%d )' 2>/dev/null | wc -l"
+                     % RTSP_PORT)
+    sessions = int(out) if out.isdigit() else 0
+
+    rc, out, _ = run("/usr/local/bin/tuxplay status 2>/dev/null")
+    delay = sync = advertised = None
+    for line in out.splitlines():
+        m = re.search(r"delay you hear:\s+(\d+)", line)
+        if m:
+            delay = int(m.group(1))
+        m = re.search(r"sync correction:\s+([+-]?\d+)", line)
+        if m:
+            sync = int(m.group(1))
+        m = re.search(r"advertised to clients:\s+(\d+)", line)
+        if m:
+            advertised = int(m.group(1))
+
+    hold = False
+    try:
+        with open(HOLD_CONF) as fh:
+            hold = "HOLD=1" in fh.read()
+    except OSError:
+        pass
+
+    _, watcher, _ = run("systemctl --user is-active tuxplay-share")
+    _, server, _ = run("systemctl is-active owntone-mini")
+
+    outputs, pair = [], None
+    rc, out, _ = run("curl -s --max-time 4 %s/api/outputs" % API)
+    try:
+        for o in json.loads(out).get("outputs", []):
+            entry = {"id": str(o["id"]), "name": o.get("name", "?"),
+                     "type": o.get("type", ""), "selected": bool(o.get("selected")),
+                     "volume": o.get("volume")}
+            outputs.append(entry)
+            # The collapsed stereo pair is still called out separately, because
+            # it is the one output whose members must be driven together.
+            if "Stereo" in entry["name"]:
+                pair = entry
+    except Exception:
+        pass
+    chosen = [o for o in outputs if o["selected"]]
+
+    silent = None
+    rc, out, _ = run("curl -s --max-time 4 %s/api/player/silence" % API)
+    try:
+        silent = json.loads(out).get("silent_msec")
+    except Exception:
+        pass
+
+    names = ", ".join(o["name"] for o in chosen) or "nothing"
+    if watcher != "active":
+        status, detail = "off", "The helper is stopped, so nothing is managing the outputs."
+    elif not outputs:
+        status, detail = "missing", "No AirPlay devices have been discovered yet."
+    elif not chosen:
+        status, detail = "released", "No output selected. Pick one below."
+    elif sessions > 0 and silent is not None and 0 <= silent < 1500:
+        status, detail = "playing", "Audio is going to %s." % names
+    elif sessions > 0:
+        status, detail = "ready", "Connected to %s and idle. Playback starts immediately." % names
+    else:
+        status, detail = "released", "%s selected, not connected yet." % names
+
+    return {"sessions": sessions, "delay": delay, "sync": sync, "advertised": advertised,
+            "hold": hold, "watcher": watcher, "server": server, "pair": pair,
+            "outputs": outputs, "silent_msec": silent, "status": status, "detail": detail}
+
+
+PAGE = """<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Tuxplay</title><style>
+:root{--bg:#15171c;--card:#1e2128;--line:#2c3038;--tx:#e8eaef;--dim:#9aa3b2;
+--on:#41c98e;--off:#6b7280;--warn:#e0a33e;--accent:#5b9dff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);
+font:17px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:640px;margin:0 auto;padding:28px 18px 60px}
+h1{font-size:26px;margin:0 0 2px;letter-spacing:-.02em}
+.sub{color:var(--dim);font-size:15px;margin-bottom:22px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+padding:20px;margin-bottom:16px}
+.row{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.lbl{font-size:18px;font-weight:600}
+.desc{color:var(--dim);font-size:14.5px;margin-top:6px}
+.pill{display:inline-flex;align-items:center;gap:9px;font-size:15px;
+padding:7px 14px;border-radius:999px;background:#272b33;border:1px solid var(--line)}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--off)}
+.dot.playing{background:var(--on);box-shadow:0 0 0 4px rgba(65,201,142,.16)}
+.dot.ready{background:var(--accent);box-shadow:0 0 0 4px rgba(91,157,255,.16)}
+.dot.released{background:var(--off)}
+.dot.missing,.dot.off{background:var(--warn)}
+.sw{position:relative;width:58px;height:32px;flex:none;border-radius:999px;
+background:#343a44;border:none;cursor:pointer;transition:background .16s}
+.sw[aria-checked=true]{background:var(--on)}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:26px;height:26px;
+border-radius:50%;background:#fff;transition:transform .16s}
+.sw[aria-checked=true]::after{transform:translateX(26px)}
+.sw:disabled{opacity:.45;cursor:default}
+input[type=range]{width:100%;margin:18px 0 6px;accent-color:var(--accent)}
+.scale{display:flex;justify-content:space-between;color:var(--dim);font-size:13px}
+.num{width:104px;font:600 17px ui-monospace,SFMono-Regular,Menlo,monospace;
+background:#171a20;color:var(--tx);border:1px solid var(--line);
+border-radius:9px;padding:9px 11px;text-align:right}
+button.act{font:600 15px inherit;background:#2b313b;color:var(--tx);
+border:1px solid var(--line);border-radius:10px;padding:10px 15px;cursor:pointer}
+button.act:hover{background:#333a45}
+button.act.primary{background:var(--accent);border-color:var(--accent);color:#07121f}
+button.act:disabled{opacity:.45;cursor:default}
+.pair{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+.facts{display:grid;grid-template-columns:1fr auto;gap:9px 16px;
+font-size:15px;color:var(--dim);margin-top:4px}
+.facts b{color:var(--tx);font-weight:600;
+font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.note{font-size:14px;color:var(--warn);margin-top:12px}
+.busy{opacity:.5;pointer-events:none}
+.out{display:flex;align-items:center;justify-content:space-between;gap:14px;
+padding:11px 0;border-top:1px solid var(--line)}
+.out:first-child{border-top:none}
+.out .nm{font-size:16px}
+.out .ty{color:var(--dim);font-size:13px;margin-top:2px}
+.sw.sm{width:48px;height:27px}
+.sw.sm::after{width:21px;height:21px}
+.sw.sm[aria-checked=true]::after{transform:translateX(21px)}
+hr{border:none;border-top:1px solid var(--line);margin:18px 0}
+</style></head><body><div class=wrap>
+
+<h1>Tuxplay</h1>
+<div class=sub id=detail>Loading&hellip;</div>
+
+<div class=card>
+  <div class=row>
+    <div><span class=pill><span class="dot" id=dot></span><span id=statustext>&mdash;</span></span></div>
+    <button class=sw id=master role=switch aria-checked=false title="Master switch"></button>
+  </div>
+  <div class=desc>Turning this off stops managing the speakers entirely and hands
+  them back to whatever else wants them. Nothing else on this page applies while
+  it is off.</div>
+  <div class=facts>
+    <span>Connections to the speakers</span><b id=sessions>&mdash;</b>
+    <span>Selected output</span><b id=selected>&mdash;</b>
+  </div>
+</div>
+
+<div class=card>
+  <div class=lbl>Play to</div>
+  <div class=desc>Any AirPlay 2 device on the network, and as many at once as you
+  like. A stereo pair appears once, as a single output; selecting it drives both
+  speakers together.<br><br>These are chosen here, not in the desktop's sound
+  panel. There the only entry from this project is <b>AirPlay 2 Output</b>; the
+  other AirPlay names you see there are PipeWire's own AirPlay 1 sinks, which
+  address one speaker each and cannot drive a pair.</div>
+  <div id=outputs style="margin-top:14px"></div>
+</div>
+
+<div class=card id=holdcard>
+  <div class=row>
+    <div class=lbl>Keep the speakers ready</div>
+    <button class=sw id=hold role=switch aria-checked=false></button>
+  </div>
+  <div class=desc><b>On:</b> the connection stays open, so playback starts
+  immediately. The speakers still go dark when nothing is playing, and another
+  device can take them whenever it asks.<br><b>Off:</b> the connection is dropped
+  a couple of seconds after audio stops, so the next play has to set the session
+  up again and takes about a second and a half to start.</div>
+</div>
+
+<div class=card id=delaycard>
+  <div class=row><div class=lbl>Delay</div><div><input class=num id=delaynum
+    type=number min=150 max=3500 step=10> <span style="color:var(--dim)">ms</span></div></div>
+  <div class=desc>How long after you press play the sound arrives. Lower is
+  snappier; too low and wifi congestion causes dropouts.</div>
+  <input type=range id=delayrange min=150 max=1200 step=10>
+  <div class=scale><span>150 &middot; snappy</span><span>1200 &middot; safe</span></div>
+  <div class=pair>
+    <button class="act primary" id=delayapply disabled>Apply delay</button>
+    <button class=act id=delayreset disabled>Cancel</button>
+  </div>
+  <div class=note>Applying restarts the audio server and PipeWire, which can
+  interrupt whatever is playing. Do it while nothing is playing.</div>
+</div>
+
+<div class=card id=synccard>
+  <div class=row><div class=lbl>Picture and sound</div>
+    <div><b id=syncval style="font-family:ui-monospace,Menlo,monospace">&mdash;</b></div></div>
+  <div class=desc>If they disagree, nudge in the direction you see. Safe to use
+  while watching something: it does not interrupt playback.</div>
+  <div class=pair>
+    <button class=act data-sync="earlier">Sound is late</button>
+    <button class=act data-sync="later">Sound is early</button>
+    <button class=act data-sync="reset">Reset</button>
+  </div>
+  <hr>
+  <div class=facts>
+    <span>Advertised to players</span><b id=advertised>&mdash;</b>
+    <span>Audio server</span><b id=server>&mdash;</b>
+  </div>
+</div>
+
+</div><script>
+let dirty=false, busy=false;
+const $=id=>document.getElementById(id);
+async function api(p,b){busy=true;document.body.classList.add('busy');
+ try{const r=await fetch(p,{method:'POST',headers:{'content-type':'application/json'},
+ body:JSON.stringify(b||{})});return await r.json()}finally{
+ busy=false;document.body.classList.remove('busy');refresh()}}
+function setsw(el,on,dis){el.setAttribute('aria-checked',on?'true':'false');el.disabled=!!dis}
+async function refresh(){
+ if(busy)return;
+ let s;try{s=await(await fetch('/api/state')).json()}catch(e){return}
+ $('dot').className='dot '+s.status;
+ $('statustext').textContent={playing:'Playing',ready:'Ready',released:'Released',
+  missing:'Not found',off:'Off'}[s.status]||s.status;
+ $('detail').textContent=s.detail;
+ $('sessions').textContent=s.sessions;
+ $('selected').textContent=s.pair?(s.pair.selected?s.pair.name:'none'):'—';
+ $('advertised').textContent=s.advertised!=null?s.advertised+' ms':'—';
+ $('server').textContent=s.server;
+ setsw($('master'),s.watcher==='active');
+ setsw($('hold'),s.hold,s.watcher!=='active');
+ const box=$('outputs'); const want=(s.outputs||[]).map(o=>o.id+':'+o.selected).join(',');
+ if(box.dataset.sig!==want){box.dataset.sig=want;box.innerHTML='';
+  for(const o of (s.outputs||[])){
+   const row=document.createElement('div');row.className='out';
+   const l=document.createElement('div');
+   l.innerHTML='<div class=nm></div><div class=ty></div>';
+   l.querySelector('.nm').textContent=o.name;
+   l.querySelector('.ty').textContent=o.type+(o.name.includes('Stereo')?' · stereo pair':'');
+   const b=document.createElement('button');b.className='sw sm';b.setAttribute('role','switch');
+   b.setAttribute('aria-checked',o.selected?'true':'false');
+   b.onclick=()=>api('/api/output',{id:o.id,on:b.getAttribute('aria-checked')!=='true'});
+   row.append(l,b);box.append(row);}}
+ $('syncval').textContent=(s.sync>0?'+':'')+(s.sync==null?'—':s.sync+' ms');
+ for(const b of document.querySelectorAll('[data-sync]'))b.disabled=s.watcher!=='active';
+ if(!dirty&&s.delay!=null){$('delaynum').value=s.delay;$('delayrange').value=Math.min(1200,s.delay)}
+}
+function markdirty(){dirty=true;$('delayapply').disabled=false;$('delayreset').disabled=false}
+$('delayrange').oninput=e=>{$('delaynum').value=e.target.value;markdirty()};
+$('delaynum').oninput=e=>{const v=+e.target.value;if(v>=150&&v<=1200)$('delayrange').value=v;markdirty()};
+$('delayreset').onclick=()=>{dirty=false;$('delayapply').disabled=true;
+ $('delayreset').disabled=true;refresh()};
+$('delayapply').onclick=async()=>{const v=+$('delaynum').value;
+ if(v<150||v>3500){alert('Delay must be between 150 and 3500 ms');return}
+ dirty=false;$('delayapply').disabled=true;$('delayreset').disabled=true;
+ await api('/api/delay',{ms:v})};
+$('master').onclick=()=>api('/api/master',{on:$('master').getAttribute('aria-checked')!=='true'});
+$('hold').onclick=()=>api('/api/hold',{on:$('hold').getAttribute('aria-checked')!=='true'});
+for(const b of document.querySelectorAll('[data-sync]'))
+ b.onclick=()=>api('/api/sync',{dir:b.dataset.sync,ms:20});
+refresh();setInterval(refresh,2500);
+</script></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, ctype):
+        raw = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        if self.path == "/":
+            self._send(200, PAGE, "text/html; charset=utf-8")
+        elif self.path == "/api/state":
+            self._send(200, json.dumps(state()), "application/json")
+        else:
+            self._send(404, "not found", "text/plain")
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            body = {}
+
+        if self.path == "/api/hold":
+            run("/usr/local/bin/tuxplay hold %s" % ("on" if body.get("on") else "off"))
+        elif self.path == "/api/master":
+            if body.get("on"):
+                run("systemctl --user start tuxplay-share")
+            else:
+                run("systemctl --user stop tuxplay-share")
+                # Hand the speakers back rather than leaving them held by a
+                # helper that is no longer running.
+                rc, out, _ = run("curl -s --max-time 4 %s/api/outputs" % API)
+                try:
+                    for o in json.loads(out).get("outputs", []):
+                        if "Stereo" in o.get("name", ""):
+                            run("curl -s --max-time 6 -X PUT -H 'Content-Type: application/json'"
+                                " -d '{\"selected\":false}' %s/api/outputs/%s" % (API, o["id"]))
+                except Exception:
+                    pass
+        elif self.path == "/api/output":
+            oid = str(body.get("id") or "")
+            want = "true" if body.get("on") else "false"
+            if oid.isdigit():
+                run("curl -s --max-time 8 -X PUT -H 'Content-Type: application/json'"
+                    " -d '{\"selected\":%s}' %s/api/outputs/%s" % (want, API, oid))
+        elif self.path == "/api/delay":
+            ms = int(body.get("ms") or 0)
+            if 150 <= ms <= 3500:
+                run("/usr/local/bin/tuxplay %d" % ms, timeout=90)
+        elif self.path == "/api/sync":
+            d = body.get("dir")
+            if d == "reset":
+                run("/usr/local/bin/tuxplay sync reset", timeout=90)
+            elif d in ("earlier", "later"):
+                run("/usr/local/bin/tuxplay sync %s %d" % (d, int(body.get("ms") or 20)),
+                    timeout=90)
+        else:
+            self._send(404, "not found", "text/plain")
+            return
+
+        self._send(200, json.dumps({"ok": True}), "application/json")
+
+
+if __name__ == "__main__":
+    srv = ThreadingHTTPServer((BIND, PORT), Handler)
+    sys.stderr.write("tuxplay-ui on http://%s:%d\n" % (BIND, PORT))
+    srv.serve_forever()

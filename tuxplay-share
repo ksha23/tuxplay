@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+# tuxplay-share - keep the speaker sessions warm, but only send audio when
+# there is audio to send.
+#
+# This mirrors what a Mac does, measured rather than guessed. With the HomePod
+# pair selected as its output, AirPlayXPCHelper holds ESTABLISHED TCP
+# connections to both speakers on port 7000 continuously - across play, stop and
+# long idles. The speakers still go dark the moment audio stops, and other
+# devices can still use them. So the session is not what makes a receiver busy;
+# sending it audio is.
+#
+# We used to hold the connections open AND stream silence into them forever,
+# which lit the speakers and made us the active sender, so nothing else could
+# have them. Dropping the sessions when idle fixed the sharing but gave up the
+# warm session, so every start paid a full setup.
+#
+# Instead: keep the pair selected so the sessions stay up, and pause playback
+# (FLUSHBUFFERED) when the sink goes silent. The receiver stops rendering and is
+# free for anyone else, the RTSP connection and its keep-alive stay up, and
+# resuming is a single SETRATEANCHORTIME.
+#
+# Cork state is not a usable signal for "is anything playing": a paused player
+# often keeps its stream uncorked and writes zeroes. So the sink's monitor is
+# sampled for actual silence, which is also how Apple's AirPlay driver decides
+# it (enableSilenceDetection / enableNonZeroPCMSampleDetection).
+set -euo pipefail
+
+SINK=${TUXPLAY_SINK:-tuxplay}
+API=${TUXPLAY_API:-http://localhost:3689}
+# Seconds of silence before we stop sending audio. Short, because pausing is
+# cheap now: the session stays up, so resuming costs one anchor rather than a
+# full setup.
+PAUSE_GRACE=${TUXPLAY_PAUSE_GRACE:-2}
+
+# Hold mode. On: keep the connection open so playback starts immediately. The
+# receivers are still parked while the sink is silent (a rate=0 anchor, see
+# outputs_airplay_park in owntone), so their indicators are dark and another
+# device can take them. Off: drop the sessions a couple of seconds after audio
+# stops, so the next start pays a full session setup. Same switch Preroll offers
+# on the Mac.
+HOLD_CONF="$HOME/.config/tuxplay-hold.conf"
+read_hold() { HOLD=0; [ -f "$HOLD_CONF" ] && . "$HOLD_CONF" 2>/dev/null || true; }
+# Peak sample value (of 32767) below which the sink counts as silent.
+# How recently the pipe must have carried audio to count as playing. owntone
+# measures this on the samples it already reads, so nothing here has to open a
+# capture stream on the sink monitor - doing that made the desktop flash its
+# microphone-in-use indicator once a second.
+AUDIO_WINDOW_MS=${TUXPLAY_AUDIO_WINDOW_MS:-900}
+# Just after taking the speakers, playback is still ramping up and the source
+# often has a gap of a second or so. The audio window above is deliberately
+# tight so a deliberate pause parks almost at once, but applying it to those
+# startup gaps parks and unparks within a second - which flashes the HomePods'
+# LEDs right as they connect. So for a short window after acquiring, and ONLY
+# then, require a longer silence before calling it idle. Steady-state play/pause
+# is untouched: once STARTUP_GRACE_SEC has passed, a pause parks as fast as it
+# always did. Set STARTUP_GRACE_SEC=0 to disable.
+# How long to wait after audio stops before parking (turning the speakers'
+# lights off). This is the lever for resume speed.
+#
+# Parking sends a rate=0 anchor; unparking has to build a fresh one, and with a
+# live source that re-anchor costs the full start_buffer_ms before a sample is
+# heard. Resuming BEFORE the park happens costs nothing, because nothing was
+# torn down. So the longer this is, the more pauses resume instantly - at the
+# cost of the lights staying on that much longer after you pause.
+#
+# 0 keeps the previous behaviour: park as soon as the audio window says quiet.
+PARK_AFTER_SEC=${TUXPLAY_PARK_AFTER:-0}
+STARTUP_GRACE_SEC=${TUXPLAY_STARTUP_GRACE:-10}
+STARTUP_QUIET_SEC=${TUXPLAY_STARTUP_QUIET:-3}
+# Sink to fall back to when the speakers are taken away. Empty means pick the
+# best local output automatically.
+FALLBACK_SINK=${TUXPLAY_FALLBACK_SINK:-}
+# How many AirPlay receivers we currently hold a control connection to. Counted
+# by RTSP control port rather than by address: every AirPlay device listens on
+# 7000, so this works for any device, where the previous hardcoded pair of IPs
+# reported zero for everything else - and zero sessions with outputs selected is
+# how a takeover is detected, so selecting any other speaker looked like being
+# thrown off and tore the whole thing down.
+RTSP_PORT=${TUXPLAY_RTSP_PORT:-7000}
+POLL=${TUXPLAY_POLL_SECONDS:-1}
+
+log() { printf '%s tuxplay-share: %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+# Index of our sink. Changes whenever PipeWire restarts, so look it up each pass.
+sink_index() {
+  pactl list short sinks 2>/dev/null | awk -v s="$SINK" '$2 == s {print $1; exit}'
+}
+
+# True when the audio reaching the sink is not digital silence.
+#
+# Cork state alone is not enough: a paused player often keeps its stream
+# uncorked and simply writes zeroes, so the sink looks busy and we keep an
+# AirPlay session open - which is why the HomePods stayed lit while paused,
+# where a Mac's go dark. Apple's own AirPlay driver decides this the same way,
+# via enableSilenceDetection / enableNonZeroPCMSampleDetection: digital silence
+# lets the stream idle.
+sink_has_audio() {
+  local ms
+  ms=$(curl -s --max-time 3 "$API/api/player/silence" 2>/dev/null \
+       | sed -n 's/.*"silent_msec"[^0-9-]*\(-\?[0-9]*\).*/\1/p') || ms=""
+  case "$ms" in ''|*[!0-9-]*) return 1;; esac
+  [ "$ms" -ge 0 ] && [ "$ms" -lt "$AUDIO_WINDOW_MS" ]
+}
+
+# True when at least one client is linked to the sink and not corked.
+someone_playing() {
+  pactl list sink-inputs 2>/dev/null | awk -v idx="$1" '
+    /^Sink Input #/  { sink = ""; }
+    /^[ \t]*Sink:/   { sink = $2 }
+    /^[ \t]*Corked:/ { if (sink == idx && $2 == "no") found = 1 }
+    END { exit found ? 0 : 1 }'
+}
+
+# Live sessions to the speakers. ss without -p needs no privileges, and owntone
+# runs as this user, so its sockets are visible here.
+session_count() {
+  ss -tn state established 2>/dev/null | grep -c ":$RTSP_PORT\b" || true
+}
+
+# Best local output to fall back to: a real sound card, never another network
+# sink. Picked fresh because device ids change across PipeWire restarts.
+pick_fallback() {
+  if [ -n "$FALLBACK_SINK" ]; then printf '%s\n' "$FALLBACK_SINK"; return; fi
+  pactl list short sinks 2>/dev/null | awk '$2 ~ /^alsa_output/ {print $2}' \
+    | grep -m1 'analog-stereo' && return 0
+  pactl list short sinks 2>/dev/null | awk '$2 ~ /^alsa_output/ {print $2; exit}'
+}
+
+# Hand the desktop's audio back to a local output and take every stream with it.
+# Losing the speakers should behave like unplugging headphones: sound keeps
+# coming out of something, rather than disappearing into a sink whose far end is
+# no longer connected to anything.
+fall_back() {
+  local fb
+  fb=$(pick_fallback)
+  if [ -z "$fb" ]; then
+    log "no local output to fall back to - leaving the default sink alone"
+    return 1
+  fi
+
+  pactl set-default-sink "$fb" >/dev/null 2>&1 || true
+
+  local idx
+  idx=$(sink_index || true)
+  if [ -n "${idx:-}" ]; then
+    pactl list short sink-inputs 2>/dev/null | awk -v i="$idx" '$2 == i {print $1}' \
+      | while read -r si; do
+          pactl move-sink-input "$si" "$fb" >/dev/null 2>&1 || true
+        done
+  fi
+
+  log "switched output to $fb"
+  return 0
+}
+
+# The outputs we are managing. Whatever the user has selected, not a hardcoded
+# stereo pair: owntone drives any AirPlay device, and several at once, so this
+# has no business deciding which. The set is remembered while audio is playing
+# and restored when we take the outputs back, because releasing them means
+# deselecting, which would otherwise lose the choice.
+WANT_CONF="$HOME/.config/tuxplay-outputs.conf"
+
+selected_ids() {
+  curl -s --max-time 5 "$API/api/outputs" 2>/dev/null | python3 -c "
+import json, sys
+try:
+    print(' '.join(str(o['id']) for o in json.load(sys.stdin).get('outputs', [])
+                   if o.get('selected')))
+except Exception:
+    pass
+" 2>/dev/null
+}
+
+remember() {
+  local ids
+  # Under pipefail a curl timeout (exit 28) is the status of this assignment,
+  # and remember is a bare statement in the loop, so `set -e` would end the
+  # service. owntone answers slowly exactly while it is retrying a speaker.
+  ids=$(selected_ids) || ids=""
+  # Explicit if, and an explicit success: this is called as a bare statement in
+  # the loop, so under `set -e` a false test here is the function's exit status
+  # and kills the service. That happened exactly when nothing was selected -
+  # which is the state right after handing the speakers over, so coming back
+  # from a takeover crash-looped instead of working.
+  if [ -n "$ids" ]; then
+    printf 'WANT="%s"\n' "$ids" > "$WANT_CONF"
+  fi
+  return 0
+}
+
+wanted_ids() {
+  WANT=""
+  [ -f "$WANT_CONF" ] && . "$WANT_CONF" 2>/dev/null || true
+  printf '%s' "$WANT"
+}
+
+# Called as bare statements, so it must not fail: a timed-out PUT is simply
+# re-sent on a later pass, where a non-zero status here would end the service.
+api_put() { curl -s --max-time 8 -X PUT "$API/$1" >/dev/null 2>&1 || true; }
+
+# True once the pair actually has sessions to both speakers.
+outputs_selected() {
+  curl -s --max-time 5 "$API/api/outputs" 2>/dev/null | python3 -c "
+import json, sys
+try:
+    outs = json.load(sys.stdin).get('outputs', [])
+except Exception:
+    sys.exit(1)
+sys.exit(0 if any(o.get('selected') for o in outs) else 1)
+" 2>/dev/null
+}
+
+# Selecting the sink in the desktop's sound settings only routes PipeWire into
+# the fifo; whether there is a live AirPlay session behind it is invisible from
+# there, so the list happily shows the pair as the output when nothing is
+# connected. Say so out loud instead of leaving it looking connected.
+notify() {
+  command -v notify-send >/dev/null 2>&1 || return 0
+  notify-send -a "Tuxplay" -u normal "$1" "$2" 2>/dev/null || true
+}
+select_pair() {  # $2 = true|false, applied to every remembered output
+  local ids id ok=1
+  ids=$(wanted_ids)
+  [ -n "$ids" ] || return 1
+  for id in $ids; do
+    curl -s --max-time 8 -X PUT -H 'Content-Type: application/json' \
+      -d "{\"selected\":$2}" "$API/api/outputs/$id" >/dev/null 2>&1 && ok=0
+  done
+  return $ok
+}
+
+# Waking on a timer meant up to a full poll interval of audio played before the
+# speakers were even asked for - and each pass costs several curl calls, so the
+# real wait is longer than POLL. A Mac has no equivalent step: its speakers are
+# already the selected output, so pressing play just connects. A client
+# appearing on our sink is the earliest possible signal that something wants to
+# play, so wait on that instead of on the clock.
+#
+# Opened read-write so the read never blocks for a writer and never sees EOF if
+# pactl dies; if it does die the read simply times out and this degrades to the
+# old fixed-interval poll.
+EVENTS_FIFO=$(mktemp -u -t tuxplay-events.XXXXXX)
+mkfifo "$EVENTS_FIFO" 2>/dev/null || EVENTS_FIFO=""
+if [ -n "$EVENTS_FIFO" ]; then
+  ( pactl subscribe 2>/dev/null | grep --line-buffered "sink-input" > "$EVENTS_FIFO" ) &
+  EVENTS_PID=$!
+  exec 9<> "$EVENTS_FIFO"
+  # Unlinked on the way out, not here: the writer opens the path when its
+  # subshell starts, and removing it first is a race it can lose.
+  trap 'kill "$EVENTS_PID" 2>/dev/null || true; rm -f "$EVENTS_FIFO"' EXIT INT TERM
+fi
+
+# Wait for the next pass. While we already have the speakers there is nothing
+# to race for, so use the plain interval and leave owntone alone; it is only
+# the idle states where the wait is pure added latency.
+wait_pass() {
+  woke=timer
+  case $state in
+    idle|surrendered|unavailable)
+      if [ -n "${EVENTS_PID:-}" ] && read -r -t "$POLL" _ <&9; then
+        woke=event
+        # Drain the rest of the burst: one client start emits several events
+        # and each would otherwise buy its own pass.
+        while read -r -t 0.05 _ <&9; do :; done
+      fi ;;
+    *)
+      sleep "$POLL" ;;
+  esac
+}
+
+woke=timer
+state=idle
+last_audio=0
+acquired_at=0
+# Consecutive polls with no sessions. A single zero happens routinely during a
+# selection change, so a takeover needs more than one to be believed.
+zero_polls=0
+# Consecutive failed attempts to take the speakers while audio is playing.
+acquire_fails=0
+ACQUIRE_FAILS_MAX=${TUXPLAY_ACQUIRE_FAILS:-5}
+# Two polls, not more. This has to conclude and deselect before owntone's
+# PLAYER_SPEAKER_RESURRECT_TIME (5 s) fires, because resurrect only stands down
+# for a device that is no longer selected. A poll costs more than the nominal
+# second once its curl calls are counted, so four polls landed at 5-6 s and lost
+# the race every time: the speakers were taken straight back and handover looked
+# broken. One poll would be enough were it not for the transient zero during a
+# selection change.
+ZERO_POLLS_FOR_TAKEOVER=${TUXPLAY_ZERO_POLLS:-2}
+indicator=unknown
+# Polls between unconditional re-asserts of the idle/park state, see the call
+# site below.
+RE_ASSERT_POLLS=${TUXPLAY_IDLE_REASSERT_POLLS:-15}
+idle_reassert=0
+
+# Take the pair once and keep it. The sessions staying up is the point.
+sleep 5
+read_hold
+if select_pair x true && outputs_selected; then
+  if [ "$HOLD" = 1 ]; then
+    log "hold on - keeping the pair connected and streaming"
+    state=playing
+  else
+    log "holding the pair - sessions stay up, audio only flows when there is some"
+    state=paused
+  fi
+else
+  log "could not take the pair yet - will retry when audio appears"
+  state=idle
+fi
+
+while :; do
+  read_hold
+  idx=$(sink_index || true)
+  now=$(date +%s)
+
+  if [ "$(session_count)" -eq 0 ]; then
+    zero_polls=$(( zero_polls + 1 ))
+  else
+    zero_polls=0
+  fi
+
+  if [ -n "${idx:-}" ] && sink_has_audio; then
+    last_audio=$now
+    remember
+    if [ "$indicator" != active ]; then
+      api_put api/player/active
+      indicator=active
+      idle_reassert=0
+    fi
+    case $state in
+      paused)
+        state=playing ;;
+      idle|surrendered|unavailable)
+        # Keep trying while there is audio. Two things went wrong here before:
+        # owntone needs a moment after being told to select, so checking
+        # immediately reported failure on a perfectly good acquire; and
+        # "unavailable" was missing from this list, so one such false failure
+        # parked the state machine there for good and no amount of pressing play
+        # would bring the speakers back.
+        log "audio here - taking the speakers (woken by $woke)"
+        acquired_at=$now
+        if select_pair x true; then
+          sleep 1
+        fi
+        if outputs_selected; then
+          acquire_fails=0
+          state=playing
+        else
+          acquire_fails=$(( acquire_fails + 1 ))
+          if [ "$acquire_fails" -eq "$ACQUIRE_FAILS_MAX" ]; then
+            log "cannot take the speakers after ${ACQUIRE_FAILS_MAX} tries - another device may have them"
+            fall_back && notify "Not connected" "The selected speakers are unavailable. Output switched to your local speakers."
+          fi
+          if [ "$acquire_fails" -ge "$ACQUIRE_FAILS_MAX" ]; then state=unavailable; else state=idle; fi
+        fi ;;
+      playing)
+        # Sessions gone while we still have audio: somebody took the speakers.
+        if [ "$zero_polls" -ge "$ZERO_POLLS_FOR_TAKEOVER" ]; then
+          log "lost the speakers to another device - standing down"
+          select_pair x false || true
+          fall_back && notify "Speakers taken" "Another device took the speakers. Output switched to your local speakers."
+          state=idle
+          last_audio=0
+        fi ;;
+    esac
+  else
+    if [ "$HOLD" = 1 ]; then
+      # Hold mode: keep the stream up regardless of silence, so playback starts
+      # instantly.
+      case $state in
+        playing)
+          # Losing the sessions with nothing playing locally means another
+          # device took the speakers. Without this check hold mode simply
+          # re-selected and started streaming again, taking them straight back -
+          # the takeover test used to live only in the branch where we have
+          # audio, which is not the branch we are in while merely holding.
+          if [ "$zero_polls" -ge "$ZERO_POLLS_FOR_TAKEOVER" ]; then
+            log "lost the speakers to another device - standing down until you play something here"
+            select_pair x false || true
+            notify "Speakers taken" "Another device took the speakers. Play something here to take them back."
+            state=surrendered
+          fi ;;
+        paused)
+          api_put api/player/idle
+          state=playing ;;
+        idle|unavailable)
+          if select_pair x true && outputs_selected; then
+            api_put api/player/idle
+            state=playing
+          fi ;;
+        surrendered)
+          : # wait for local audio; re-grabbing unasked is what we just fixed
+          ;;
+      esac
+      # Nothing is actually playing, so park the stream: owntone sends the
+      # receivers SETRATEANCHORTIME rate=0 and stops feeding them, which turns
+      # the HomePods' white top LEDs off while leaving the session, its RTSP
+      # connection and its keep-alive up. Measured: park turns the LEDs off,
+      # unpark turns them back on. That is what a Mac does - it holds a session
+      # open with the speakers dark and they light only while audio plays.
+      #
+      # Re-asserted every RE_ASSERT_POLLS passes, not just on the transition,
+      # because owntone forgets it across a restart: a restarted owntone brings
+      # fresh unparked sessions up while this loop still believes it has
+      # already said "idle", and the speakers would sit lit until the next
+      # play/stop cycle. Parking is idempotent, so re-asserting costs nothing.
+      if [ "$state" = playing ]; then
+        since_acquire=$(( now - acquired_at ))
+        quiet_for=$(( now - last_audio ))
+        if [ "$indicator" = active ] \
+           && [ "$since_acquire" -lt "$STARTUP_GRACE_SEC" ] \
+           && [ "$quiet_for" -lt "$STARTUP_QUIET_SEC" ]; then
+          : # Startup gap, not a pause. Parking here flashes the LEDs.
+        elif [ "$indicator" = active ] && [ "$quiet_for" -lt "$PARK_AFTER_SEC" ]; then
+          : # Hold the park so a quick resume does not have to re-anchor.
+        elif [ "$indicator" != idle ] || [ "$idle_reassert" -le 0 ]; then
+          api_put api/player/idle
+          indicator=idle
+          idle_reassert=$RE_ASSERT_POLLS
+        else
+          idle_reassert=$(( idle_reassert - 1 ))
+        fi
+      fi
+    elif [ "$state" = playing ] && [ $(( now - last_audio )) -ge "$PAUSE_GRACE" ]; then
+      log "silent ${PAUSE_GRACE}s - releasing, speakers free for other devices"
+      select_pair x false || true
+      state=idle
+    elif [ "$state" = unavailable ]; then
+      state=idle
+    fi
+  fi
+
+  wait_pass
+done

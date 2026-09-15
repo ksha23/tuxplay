@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep the desktop volume slider and the AirPlay volume in sync
+After=pipewire.service
+Wants=pipewire.service
+PartOf=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tuxplay-volume
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
