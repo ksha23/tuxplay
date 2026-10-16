@@ -27,6 +27,10 @@ other AirPlay 2 receivers.
   speakers themselves are on Wi-Fi.
 - **Shares with other devices.** A phone or Mac can take the speakers at any time.
   Tuxplay steps aside and takes them back only when something new plays here.
+- **Holds the speakers, or lets them go.** By default Tuxplay keeps the speakers
+  for as long as they are selected, as a Mac does. It can instead release them
+  after a chosen time without sound, so they go dark and are free; the next
+  sound takes them back.
 - **Survives network changes.** Unplugging the cable, switching between Ethernet
   and Wi-Fi, or losing the network for a while needs no restart: sessions move to
   whatever is still up, usually within two seconds.
@@ -53,7 +57,7 @@ The sound panel has one entry for this project, **Tuxplay (AirPlay 2)**. Which
 receivers it feeds is chosen in Tuxplay:
 
 - **Top bar.** The icon shows the current state. Its menu has a checkbox per
-  device, and **Settings...** opens the delay control. Needs a shell that shows
+  device, and **Settings...** opens the delay and idle-release controls. Needs a shell that shows
   AppIndicators, which Ubuntu does by default.
 - **Web page.** `http://<this-machine>:8730` offers the same controls from a
   browser, a phone, or a desktop without a tray.
@@ -66,14 +70,20 @@ computer never takes speakers another device is using.
 ## Tuning
 
 ```sh
-tuxplay status              # delay, sync correction, what players are told
+tuxplay status              # delay, sync correction, what players are told, idle release
 tuxplay delay 250           # the delay you hear, in ms (50-5000)
+tuxplay idle 30             # release the speakers after 30 min without sound
+tuxplay idle never          # keep them while selected (the default)
 ```
 
 **delay** trades responsiveness for robustness. Lower starts sooner, too low
 gives dropouts on a busy network. 250 ms suits a wired network. A change applies
 at once: what is playing pauses for a moment and continues with the new delay,
 and players are told the new value at the same time.
+
+**idle** is also in the top bar's settings and on the web page. Releasing
+closes the connection to the speakers, so the first second of the next sound
+is lost while it reconnects.
 
 For a player that gets picture and sound wrong anyway, `tuxplay sync earlier 20`
 (sound is late), `tuxplay sync later 20` (sound is early) and `tuxplay sync reset`
@@ -88,7 +98,8 @@ change only what players are told. Normally none is needed.
 | `tuxplay-indicator` | user service: the top bar icon and settings window |
 | `tuxplay` | the command line tool |
 
-Speaker choices, volumes and the delay are kept in `~/.local/state/tuxplayd.json`.
+Speaker choices, volumes, the delay and the idle release are kept in
+`~/.local/state/tuxplayd.json`.
 
 ## How it works
 

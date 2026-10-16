@@ -22,7 +22,7 @@ struct player_config
   int join_ms;        // how far ahead of the write head a start is anchored
   int pause_ms;       // pause the speakers after this much digital silence; 0 = never, they
                       // stay lit and silence is streamed, as macOS 27 does (the default)
-  int idle_release_s; // close the sessions after this much silence, 0 = never
+  int idle_release_s; // release the speakers after this much silence, 0 = never (saved setting wins)
 };
 
 int
@@ -64,6 +64,13 @@ player_sync_ms(void);
 
 int
 player_sync_set(int ms);
+
+// Release the speakers after this long without sound, 0 = never (default)
+int
+player_idle_release_s(void);
+
+int
+player_idle_release_set(int seconds);
 
 struct json_object *
 player_status_json(void);

@@ -40,11 +40,16 @@ def state():
                      % RTSP_PORT)
     sessions = int(out) if out.isdigit() else 0
 
-    delay = advertised = None
+    delay = advertised = idle = None
     rc, out, _ = run("curl -s --max-time 4 %s/api/latency" % API)
     try:
         lat = json.loads(out)
         delay, advertised = lat.get("ms"), lat.get("advertised_ms")
+    except Exception:
+        pass
+    rc, out, _ = run("curl -s --max-time 4 %s/api/idle" % API)
+    try:
+        idle = json.loads(out).get("minutes")
     except Exception:
         pass
 
@@ -87,7 +92,7 @@ def state():
     else:
         status, detail = "released", "%s selected, not connected yet." % names
 
-    return {"sessions": sessions, "delay": delay, "advertised": advertised,
+    return {"sessions": sessions, "delay": delay, "advertised": advertised, "idle": idle,
             "watcher": watcher, "pair": pair,
             "outputs": outputs, "silent_msec": silent, "status": status, "detail": detail}
 
@@ -197,6 +202,16 @@ hr{border:none;border-top:1px solid var(--line);margin:18px 0}
   </div>
 </div>
 
+<div class=card id=idlecard>
+  <div class=row><div class=lbl>Release when idle</div><div><select class=num id=idlesel>
+    <option value=0>Never</option><option value=5>5 min</option><option value=10>10 min</option>
+    <option value=15>15 min</option><option value=30>30 min</option><option value=60>1 hour</option>
+    <option value=120>2 hours</option></select></div></div>
+  <div class=desc>After this long without sound, Tuxplay lets go of the speakers:
+  they go dark and are free for anything else. The next sound here takes them
+  again, with about a second cut from its start. Never keeps them, as a Mac does.</div>
+</div>
+
 
 </div><script>
 let dirty=false, busy=false;
@@ -230,12 +245,18 @@ async function refresh(){
    b.onclick=()=>api('/api/output',{id:o.id,on:b.getAttribute('aria-checked')!=='true'});
    row.append(l,b);box.append(row);}}
  if(!dirty&&s.delay!=null){$('delaynum').value=s.delay;$('delayrange').value=Math.min(1200,s.delay)}
+ const isel=$('idlesel');
+ if(s.idle!=null&&document.activeElement!==isel){
+  if(![...isel.options].some(o=>+o.value===s.idle)){const o=document.createElement('option');
+   o.value=s.idle;o.textContent=s.idle+' min';isel.appendChild(o)}
+  isel.value=String(s.idle)}
 }
 function markdirty(){dirty=true;$('delayapply').disabled=false;$('delayreset').disabled=false}
 $('delayrange').oninput=e=>{$('delaynum').value=e.target.value;markdirty()};
 $('delaynum').oninput=e=>{const v=+e.target.value;if(v>=150&&v<=1200)$('delayrange').value=v;markdirty()};
 $('delayreset').onclick=()=>{dirty=false;$('delayapply').disabled=true;
  $('delayreset').disabled=true;refresh()};
+$('idlesel').onchange=e=>api('/api/idle',{minutes:+e.target.value});
 $('delayapply').onclick=async()=>{const v=+$('delaynum').value;
  if(v<150||v>3500){alert('Delay must be between 150 and 3500 ms');return}
  dirty=false;$('delayapply').disabled=true;$('delayreset').disabled=true;
@@ -283,6 +304,11 @@ class Handler(BaseHTTPRequestHandler):
             if oid.isdigit():
                 run("curl -s --max-time 8 -X PUT -H 'Content-Type: application/json'"
                     " -d '{\"selected\":%s}' %s/api/outputs/%s" % (want, API, oid))
+        elif self.path == "/api/idle":
+            minutes = int(body.get("minutes") or 0)
+            if 0 <= minutes <= 1440:
+                run("curl -s --max-time 8 -X PUT -H 'Content-Type: application/json'"
+                    " -d '{\"minutes\":%d}' %s/api/idle" % (minutes, API))
         elif self.path == "/api/delay":
             ms = int(body.get("ms") or 0)
             if 150 <= ms <= 3500:

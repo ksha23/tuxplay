@@ -7,6 +7,8 @@
 #   sync    a correction against the picture. It only changes the latency
 #           players are told, so they hold the picture back more or less; the
 #           sound itself is not touched and nothing pauses.
+#   idle    release the speakers after this many minutes without sound, so
+#           they go dark and are free. Never, by default, as with a Mac.
 set -euo pipefail
 
 API=${TUXPLAY_API:-http://localhost:3689}
@@ -20,6 +22,8 @@ usage:
   tuxplay sync earlier <ms> sound arrives late (picture ahead): move it earlier
   tuxplay sync later <ms>   sound arrives early: move it later
   tuxplay sync reset        no correction
+  tuxplay idle <minutes>    release the speakers after this long without sound
+  tuxplay idle never        never release them (the default)
 
 Nudge sync 20 ms at a time; below about 20 ms nobody can see the difference.
 EOF
@@ -53,6 +57,24 @@ case "$1" in
     printf 'delay you hear:        %s ms (anchor lead)\n' "$(field "$j" ms)"
     printf 'sync correction:       %+d ms\n' "$(field "$j" sync_ms)"
     printf 'advertised to clients: %s ms\n' "$(field "$j" advertised_ms)"
+    m=$(field "$(curl -s --max-time 4 "$API/api/idle")" minutes)
+    if [ "$m" -gt 0 ]; then
+      printf 'release when idle:     after %s min without sound\n' "$m"
+    else
+      printf 'release when idle:     never\n'
+    fi
+    ;;
+
+  idle)
+    [ $# -eq 2 ] || usage
+    case "$2" in
+      off|never) m=0 ;;
+      *) is_ms "$2" || usage; m=$2 ;;
+    esac
+    out=$(curl -s --max-time 6 -X PUT -H 'Content-Type: application/json' -d "{\"minutes\": $m}" "$API/api/idle") \
+      || die "tuxplayd is not answering on $API"
+    case "$out" in *'"result"'*) ;; *) die "tuxplayd refused it: $out" ;; esac
+    if [ "$m" -gt 0 ]; then echo "releasing the speakers after $m min without sound"; else echo "never releasing the speakers"; fi
     ;;
 
   delay)

@@ -44,6 +44,10 @@ MENU_CHARS = 34
 # Above this many selected speakers, say how many rather than name them.
 MENU_NAMES_MAX = 2
 
+# Release when idle, in minutes; 0 = never
+IDLE_CHOICES = ((0, "Never"), (5, "After 5 min"), (10, "After 10 min"), (15, "After 15 min"),
+                (30, "After 30 min"), (60, "After 1 hour"), (120, "After 2 hours"))
+
 ICON = {"playing": "audio-volume-high-symbolic",
         "ready": "audio-speakers-symbolic",
         "released": "audio-volume-muted-symbolic",
@@ -185,6 +189,16 @@ class Panel(Gtk.Window):
         drow.pack_start(self.btn_reset, True, True, 0)
         outer.pack_start(drow, False, False, 0)
 
+        # Applies on change: unlike the delay, it interrupts nothing
+        outer.pack_start(self._label("RELEASE WHEN IDLE"), False, False, 0)
+        self.idle = Gtk.ComboBoxText()
+        for minutes, text in IDLE_CHOICES:
+            self.idle.append(str(minutes), text)
+        self.idle.set_tooltip_text("After this long without sound the speakers are let go:\n"
+                                   "dark and free for other devices. The next sound takes them again.")
+        self.idle_handler = self.idle.connect("changed", self.on_idle)
+        outer.pack_start(self.idle, False, False, 0)
+
 
     def _label(self, text):
         l = Gtk.Label(xalign=0)
@@ -234,6 +248,11 @@ class Panel(Gtk.Window):
         self.btn_reset.set_sensitive(False)
         self.show_applied()
 
+    def on_idle(self, combo):
+        minutes = combo.get_active_id()
+        if minutes is not None:
+            run_command(lambda: sh("%s idle %s" % (TUXPLAY, minutes)), self.app.refresh)
+
     def show_applied(self):
         if self.applied_delay is None:
             return
@@ -273,6 +292,14 @@ class Panel(Gtk.Window):
             sw.handler_block(h)
             sw.set_active(bool(o["selected"]))
             sw.handler_unblock(h)
+
+        idle = s.get("idle")
+        if idle is not None:
+            if not any(str(m) == str(idle) for m, _ in IDLE_CHOICES) and self.idle.get_active_id() != str(idle):
+                self.idle.append(str(idle), "%d min" % idle)
+            self.idle.handler_block(self.idle_handler)
+            self.idle.set_active_id(str(idle))
+            self.idle.handler_unblock(self.idle_handler)
 
         delay, adv = s.get("delay"), s.get("advertised")
         if delay is not None:

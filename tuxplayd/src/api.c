@@ -213,6 +213,32 @@ latency_cb(struct evhttp_request *req, void *arg)
     reply_status(req, 200, "ok");
 }
 
+// GET: {"minutes": N}; PUT {"minutes": N} releases the speakers after N
+// minutes without sound, 0 = never
+static void
+idle_cb(struct evhttp_request *req, void *arg)
+{
+  struct json_object *body, *v;
+
+  if (evhttp_request_get_command(req) == EVHTTP_REQ_GET)
+    {
+      struct json_object *o = json_object_new_object();
+      json_object_object_add(o, "minutes", json_object_new_int(player_idle_release_s() / 60));
+      reply_json(req, 200, o);
+      return;
+    }
+
+  body = body_json(req);
+  if (!body || !json_object_object_get_ex(body, "minutes", &v))
+    reply_status(req, 400, "expected {\"minutes\": N}, 0 = never");
+  else if (player_idle_release_set(json_object_get_int(v) * 60) < 0)
+    reply_status(req, 400, "out of range (0-1440)");
+  else
+    reply_status(req, 200, "ok");
+  if (body)
+    json_object_put(body);
+}
+
 int
 api_start(struct event_base *evbase, const char *address, uint16_t port)
 {
@@ -224,6 +250,7 @@ api_start(struct event_base *evbase, const char *address, uint16_t port)
   evhttp_set_cb(http, "/api/outputs", outputs_cb, NULL);
   evhttp_set_cb(http, "/api/status", status_cb, NULL);
   evhttp_set_cb(http, "/api/latency", latency_cb, NULL);
+  evhttp_set_cb(http, "/api/idle", idle_cb, NULL);
   evhttp_set_cb(http, "/api/player/silence", player_cb, NULL);
   evhttp_set_cb(http, "/api/player/active", player_cb, NULL);
   evhttp_set_cb(http, "/api/player/idle", player_cb, NULL);

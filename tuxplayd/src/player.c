@@ -1,5 +1,6 @@
 #include <math.h>
 #include <spawn.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +53,7 @@ static struct
   bool audible;
   uint64_t audible_frame;   // first audible frame of the current run
   int64_t restart_after_ns; // a failed output is not restarted before this
+  int64_t check_due_ns;     // when the pending check runs, 0 if none
   int network_reconnect_ms;  // delay after the latest network change
   bool network_retry;        // reconnect outputs mDNS cannot see yet
 
@@ -142,12 +144,26 @@ advertised_latency_push(void)
   sink_latency_set((int64_t)advertised_ms() * 1000000LL);
 }
 
+// Runs the check within delay_ms. A check already due sooner covers it: each
+// check works out on its own what falls due later (a reconnect, a release),
+// so a later deadline is never lost to an earlier one.
 static void
 check_schedule(int delay_ms)
 {
+  int64_t due = mono_ns() + (int64_t)delay_ms * 1000000LL;
   struct timeval tv = { delay_ms / 1000, (delay_ms % 1000) * 1000 };
 
+  if (pl.check_due_ns && pl.check_due_ns <= due && evtimer_pending(pl.check_ev, NULL))
+    return;
+  pl.check_due_ns = due;
   evtimer_add(pl.check_ev, &tv);
+}
+
+static void
+due_at(int64_t *next_ns, int64_t when_ns)
+{
+  if (when_ns < *next_ns)
+    *next_ns = when_ns;
 }
 
 static bool
@@ -298,8 +314,10 @@ output_anchor(struct output *out, const struct timeline_snapshot *snap)
 /* --------------------------------- Check ---------------------------------- */
 
 static void
-output_check(struct output *out, const struct timeline_snapshot *snap, bool *ptp_wait)
+output_check(struct output *out, const struct timeline_snapshot *snap, int64_t *next_ns)
 {
+  int64_t now = mono_ns();
+  int64_t release_ms = (int64_t)pl.cfg.idle_release_s * 1000;
   bool failed = false, taken = false, lost_net = false;
   int n = 0, ready = 0, playing = 0;
 
@@ -360,17 +378,28 @@ output_check(struct output *out, const struct timeline_snapshot *snap, bool *ptp
 
   if (n == 0)
     {
-      if (mono_ns() >= pl.restart_after_ns)
+      if (now >= pl.restart_after_ns)
         output_start(out);
+      else
+        due_at(next_ns, pl.restart_after_ns);
       return;
     }
 
-  if (!pl.audible && pl.cfg.idle_release_s > 0 && stream_silence_ms() >= pl.cfg.idle_release_s * 1000LL)
+  // Nothing played for the idle time: release the speakers. The output stays
+  // selected, and the next sound here takes them again.
+  if (!pl.audible && release_ms > 0)
     {
-      log_info(MOD, "%s: silent for %d s, releasing the speakers", out->name, pl.cfg.idle_release_s);
-      output_stop(out);
-      out->claimed = false;
-      return;
+      int64_t silent_ms = stream_silence_ms();
+
+      if (silent_ms >= release_ms)
+        {
+          log_info(MOD, "%s: nothing played for %d min, releasing the speakers", out->name,
+                   pl.cfg.idle_release_s / 60);
+          output_stop(out);
+          out->claimed = false;
+          return;
+        }
+      due_at(next_ns, now + (release_ms - silent_ms + 50) * 1000000LL);
     }
 
   if (!pl.audible && pl.cfg.pause_ms > 0)
@@ -398,7 +427,7 @@ output_check(struct output *out, const struct timeline_snapshot *snap, bool *ptp
           if (snap->state == TIMELINE_OWN && !pl.ptp_warned)
             log_warn(MOD, "%s: not following the receivers' clock yet, waiting to anchor", out->name);
           pl.ptp_warned = snap->state == TIMELINE_OWN;
-          *ptp_wait = true;
+          due_at(next_ns, now + PTP_RECHECK_MS * 1000000LL);
           return;
         }
       pl.ptp_warned = false;
@@ -411,20 +440,21 @@ check_cb(evutil_socket_t fd, short what, void *arg)
 {
   struct timeline_snapshot snap;
   struct output *out;
-  bool ptp_wait = false;
+  int64_t next_ns = INT64_MAX;
 
+  pl.check_due_ns = 0;
   timeline_get(&snap);
   for (out = devices_outputs(); out; out = out->next)
     {
-      output_check(out, &snap, &ptp_wait);
+      output_check(out, &snap, &next_ns);
 
       // The slider follows the speakers from the moment they are reachable
       if (!pl.slider_synced && out->selected && output_has_sessions(out))
         slider_sync(out);
     }
 
-  if (ptp_wait)
-    check_schedule(PTP_RECHECK_MS);
+  if (next_ns != INT64_MAX)
+    check_schedule((int)(MAX(next_ns - mono_ns(), 0) / 1000000));
 }
 
 // A new grandmaster (one left, or a better one appeared): anchors on the old
@@ -540,8 +570,6 @@ activity_cb(bool audible, uint64_t frame, void *arg)
     }
 
   check_schedule(0);
-  if (!audible && pl.cfg.idle_release_s > 0)
-    check_schedule(MAX(pl.cfg.idle_release_s * 1000 - silence_detect_ms(), 0) + 50);
 }
 
 /* ---------------------------- Public interface ---------------------------- */
@@ -571,6 +599,7 @@ player_init(struct event_base *evbase, const struct player_config *cfg)
   mac_format(pl.sender_id, mac);
 
   pl.cfg.lead_ms = devices_setting_get("lead_ms", pl.cfg.lead_ms);
+  pl.cfg.idle_release_s = devices_setting_get("idle_release_s", pl.cfg.idle_release_s);
   pl.sync_ms = devices_setting_get("sync_ms", 0);
   advertised_latency_push();
 
@@ -721,6 +750,28 @@ player_sync_ms(void)
   return pl.sync_ms;
 }
 
+int
+player_idle_release_s(void)
+{
+  return pl.cfg.idle_release_s;
+}
+
+// 0 = never release
+int
+player_idle_release_set(int seconds)
+{
+  if (seconds < 0 || seconds > 24 * 3600)
+    return -1;
+  pl.cfg.idle_release_s = seconds;
+  devices_setting_set("idle_release_s", seconds);
+  if (seconds)
+    log_info(MOD, "Releasing the speakers after %d min without sound", seconds / 60);
+  else
+    log_info(MOD, "Never releasing the speakers when idle");
+  check_schedule(0);
+  return 0;
+}
+
 // Takes effect at once: what is playing is paused and anchored again with the
 // new lead (a short gap), since an anchor cannot be moved while it plays
 int
@@ -769,6 +820,7 @@ player_status_json(void)
   json_object_object_add(o, "lead_ms", json_object_new_int(pl.cfg.lead_ms));
   json_object_object_add(o, "sync_ms", json_object_new_int(pl.sync_ms));
   json_object_object_add(o, "advertised_ms", json_object_new_int(advertised_ms()));
+  json_object_object_add(o, "idle_release_s", json_object_new_int(pl.cfg.idle_release_s));
   json_object_object_add(o, "audible", json_object_new_boolean(pl.audible));
   json_object_object_add(o, "silence_ms", json_object_new_int64(stream_silence_ms()));
   json_object_object_add(o, "ptp", json_object_new_string(
