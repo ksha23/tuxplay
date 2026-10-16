@@ -102,6 +102,9 @@ main(int argc, char **argv)
 
   evbase = event_base_new();
 
+  // Children (playerctl) are not waited for: let the kernel reap them
+  signal(SIGCHLD, SIG_IGN);
+
   // Apple's form: the MAC followed by 0x0008 (the pair's grandmaster here is
   // acbcb5060f670008)
   if (!local_mac_get(mac))

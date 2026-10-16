@@ -21,6 +21,14 @@ enum session_state
   SESSION_STOPPED,   // torn down at the owner's request; the owner frees it
 };
 
+// updateMRPlaybackState values
+#define MR_PLAYING 1
+#define MR_PAUSED  2
+#define MR_STOPPED 3
+
+// A MediaRemote command from the receiver ("play", "paus", "nitm", "pitm")
+typedef void (*session_media_cb)(const char *cmd, void *arg);
+
 struct session_params
 {
   const char *sender_name;  // shown on the receiver
@@ -29,6 +37,8 @@ struct session_params
   uint64_t clock_id;        // our PTP clock identity
   const char *const *peers; // every receiver playing in the group (may include this one)
   int npeers;
+  session_media_cb media_cb;
+  void *media_arg;
 };
 
 struct session;
@@ -69,10 +79,18 @@ session_stop(struct session *s);
 void
 session_free(struct session *s);
 
-// The receiver asked us to stand down or hung up on us: another sender took
-// it over
+// The receiver hung up on us: another sender took it over
 bool
 session_taken_over(const struct session *s);
+
+// The receiver's volume when we connected (dB, from GET /info)
+bool
+session_initial_volume(const struct session *s, double *db);
+
+// What the receiver shows: MR_PLAYING or MR_PAUSED. Sent only while playing,
+// and only on a change.
+void
+session_playback_state(struct session *s, int state);
 
 enum session_state
 session_state(const struct session *s);

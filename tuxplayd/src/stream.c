@@ -87,6 +87,7 @@ stream_activity_cb_set(int idle_ms, stream_activity_cb cb, void *arg)
 void
 stream_init(void)
 {
+  alac_init();
   // A random rtptime origin, as every sender uses
   st.rtp_base = (uint32_t)random_u64();
 }

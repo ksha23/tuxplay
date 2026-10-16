@@ -1,4 +1,5 @@
 #include <math.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +68,42 @@ volume_to_db(int volume)
   if (volume <= 0)
     return -144.0;
   return -30.0 + (double)volume * 30.0 / 100.0;
+}
+
+static int
+db_to_volume(double db)
+{
+  if (db <= -30.0)
+    return 0;
+  if (db >= 0.0)
+    return 100;
+  return (int)lround((db + 30.0) * 100.0 / 30.0);
+}
+
+extern char **environ;
+
+// A tap on a speaker, or Siri: passed to the desktop's media player over
+// MPRIS, as a Mac passes it to its now-playing app
+static void
+media_command(const char *cmd, void *arg)
+{
+  static const struct { const char *airplay, *mpris; } map[] = {
+    { "paus", "pause" }, { "play", "play" }, { "nitm", "next" }, { "pitm", "previous" },
+  };
+  const char *verb = NULL;
+  pid_t pid;
+
+  for (size_t i = 0; i < ARRAY_SIZE(map); i++)
+    if (strcmp(cmd, map[i].airplay) == 0)
+      verb = map[i].mpris;
+  if (!verb)
+    return;
+
+  char *argv[] = { "playerctl", (char *)verb, NULL };
+  if (posix_spawnp(&pid, "playerctl", NULL, NULL, argv, environ) != 0)
+    log_warn(MOD, "Could not run playerctl %s (is playerctl installed?)", verb);
+  else
+    log_info(MOD, "Speaker asked to %s: playerctl %s", cmd, verb);
 }
 
 // What players are told the latency is. A negative sync_ms (sound late) makes
@@ -190,6 +227,8 @@ output_start(struct output *out)
   sp.clock_id = timeline_clock_id();
   sp.peers = peers;
   sp.npeers = group_addresses(peers);
+  sp.media_cb = media_command;
+  sp.media_arg = NULL;
 
   log_info(MOD, "%s: starting %d session(s), %d receiver(s) in the group", out->name, out->nmembers, sp.npeers);
   for (int i = 0; i < out->nmembers; i++)
@@ -430,12 +469,28 @@ player_network_changed(enum netwatch_event ev, const char *addr, int ifindex, vo
       }
 }
 
+// The speakers keep their own volume, as with a Mac: on connecting, the
+// volume leader's level becomes the output's, and the desktop slider moves to
+// it. Volume is sent only when someone changes it here.
 static void
 session_state_changed(struct session *sess, enum session_state state, void *arg)
 {
-  if (state == SESSION_READY && session_receiver(sess)->output &&
-      output_volume_leader(session_receiver(sess)->output) == session_receiver(sess))
-    output_volume_send(session_receiver(sess)->output);
+  struct receiver *r = session_receiver(sess);
+  struct output *out = r ? r->output : NULL;
+  double db;
+
+  if (state == SESSION_READY && out && output_volume_leader(out) == r && session_initial_volume(sess, &db))
+    {
+      int volume = db_to_volume(db);
+      if (volume != out->volume)
+        {
+          log_info(MOD, "%s: the speakers are at %.1f dB, volume %d", out->name, db, volume);
+          out->volume = volume;
+          devices_state_save();
+        }
+      if (out->selected)
+        slider_sync(out);
+    }
   check_schedule(0);
 }
 
@@ -461,6 +516,12 @@ activity_cb(bool audible, uint64_t frame, void *arg)
         if (out->selected)
           out->claimed = true;
     }
+
+  // The speakers show playing or paused, so a tap on them asks for the other
+  for (out = devices_outputs(); out; out = out->next)
+    for (int i = 0; i < out->nmembers; i++)
+      if (out->members[i]->session)
+        session_playback_state(out->members[i]->session, audible ? MR_PLAYING : MR_PAUSED);
   check_schedule(0);
   if (!audible && pl.cfg.idle_release_s > 0)
     check_schedule(MAX(pl.cfg.idle_release_s * 1000 - silence_detect_ms(), 0) + 50);

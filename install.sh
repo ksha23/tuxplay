@@ -17,8 +17,8 @@ sudo apt-get update -qq
 sudo apt-get install -y -qq \
   build-essential pkg-config \
   libpipewire-0.3-dev libspa-0.2-dev libevent-dev libsodium-dev libplist-dev \
-  libavahi-client-dev libssl-dev libjson-c-dev \
-  curl python3 gir1.2-ayatanaappindicator3-0.1
+  libavahi-client-dev libssl-dev libjson-c-dev libavcodec-dev libavutil-dev \
+  curl python3 playerctl gir1.2-ayatanaappindicator3-0.1
 
 say "building tuxplayd"
 make -C "$HERE/tuxplayd" -j"$(nproc)"

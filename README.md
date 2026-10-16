@@ -16,7 +16,14 @@ other AirPlay 2 receivers.
 - **Video stays in sync.** Players are told the real delay, so they hold the
   picture back to match. Nothing to adjust.
 - **Volume that reaches the speakers.** The desktop slider sets the speakers' own
-  volume. For a pair, it goes to the pair's leader, as a Mac does.
+  volume, and on connecting it moves to wherever the speakers already are, so a
+  level set with Siri or the Home app is kept. For a pair, volume goes to the
+  pair's leader, as a Mac does.
+- **Tap to pause.** A tap on a HomePod, or asking Siri to pause, skip or go back,
+  controls the player on the desktop (through MPRIS), as it controls a Mac's.
+- **Light on the network.** Audio is compressed ALAC, lossless, and silence costs
+  almost nothing (about 0.06 Mbit/s per speaker), which matters because the
+  speakers themselves are on Wi-Fi.
 - **Shares with other devices.** A phone or Mac can take the speakers at any time.
   Tuxplay steps aside and takes them back only when something new plays here.
 - **Survives network changes.** Unplugging the cable, switching between Ethernet
@@ -91,7 +98,8 @@ app  ->  PipeWire sink "Tuxplay"  ->  tuxplayd  ->  AirPlay 2 (buffered, PTP)  -
 `tuxplayd` is one program. Its sink is a PipeWire driver clocked by the
 speakers' own PTP clock, so audio is produced at exactly the rate the speakers
 play it: nothing drifts, nothing is resampled. Each 352-sample frame is encoded as
-ALAC and sent to every selected receiver over AirPlay 2's buffered transport,
+ALAC (libavcodec's encoder, with digital silence as 20-byte frames) and sent to
+every selected receiver over AirPlay 2's buffered transport,
 with an anchor that says when it plays on that shared clock. Frame F always plays
 at the time it was produced plus the delay, for every receiver, which is what
 keeps pairs and groups in step.
@@ -125,7 +133,7 @@ of your Home. The pairing and stream code is vendored from
 ## License
 
 MIT, per `LICENSE`. The vendored code in `tuxplayd/vendor/` is MIT as well, under
-its authors' copyright.
+its authors' copyright. tuxplayd links FFmpeg's libavcodec (LGPL) dynamically.
 
 AirPlay, Apple TV and HomePod are trademarks of Apple Inc. This project is not
 affiliated with or endorsed by Apple. The names are used only to describe what it

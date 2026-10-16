@@ -56,12 +56,14 @@ the wire.
 | | macOS 27 | tuxplayd |
 |---|---|---|
 | Pairing | HomeKit pair-verify (`HKP 6`) | HomeKit transient (`HKP 4`), the method for senders outside the Home |
-| Headers | client headers on `/pair-verify` only, then just CSeq and User-Agent | the same values, but on every request |
+| Headers | client headers on `/pair-verify` only, then just CSeq and User-Agent | the same, on pair-setup |
 | Keep-alive, CSeq | as above | the same |
 | PTP | follower, Delay_Req to every member, no Signaling | the same. The HomePods then treat both senders alike, announcing once a second (to a sender that skips a member's Delay_Req, that member announces four times a second) |
 | Stream | realtime APAT, adaptive latency | buffered ALAC over TCP, fixed lead |
 | Latency on Ethernet | about 290 ms | 250 ms lead, the whole delay (the HomePod states `arrivalToRenderLatencyMs` 4) |
-| Idle | streams silence, stays lit | the same (`-P` sets a pause instead) |
+| Idle | streams silence, stays lit | the same (`-P` sets a pause instead), at 0.06 Mbit/s |
+| Volume on connect | adopts the speaker's | the same |
+| A tap on the speaker | pauses its player | pauses the desktop's player (MPRIS) |
 | Another sender takes over | the Mac switches its output away | stands down, takes the speakers back when something new plays |
 
 The stream type is the one real difference. Realtime APAT is undocumented and
@@ -104,19 +106,36 @@ interfaces with NetworkManager while a stream played, tuxplayd never restarted.
   MAC and brings a reconnected Ethernet up without routes. `arp_ignore = 1` and
   `arp_announce = 2` fix it.
 
-## Found by an independent comparison, not yet done
+## Found by an independent comparison
 
-- **Bitrate.** tuxplayd's ALAC frames are uncompressed: 2.31 Mbit/s per receiver,
-  the same in silence. The Mac's realtime AAC-ELD runs at 0.47 Mbit/s. The
-  HomePods are on Wi-Fi, so a held pair costs 4.6 Mbit/s of airtime. Real ALAC
-  coding would fix it, and a silent frame would drop under 100 bytes.
-- **Volume on connect.** The Mac sends none and adopts the receiver's
-  `initialVolume`. tuxplayd sends its saved level, overriding Siri or the Home app.
-- **MediaRemote.** A tap on the HomePod sends `paus`, which tuxplayd treats as a
-  takeover. The Mac pauses its player instead and keeps the pair. The Mac also
-  sends now-playing info and advertises only the commands its player supports.
-- **Smaller ones.** One stable UUID for client and timing-peer id, delayed ACKs
-  on the control connection, ECN, and RECORD and `/audioMode`, which the Mac skips.
+- **Bitrate (fixed).** tuxplayd's ALAC frames were uncompressed, 2.31 Mbit/s per
+  receiver even in silence, where the Mac's realtime AAC-ELD runs at 0.47. The
+  HomePods are on Wi-Fi, so a held pair cost 4.6 Mbit/s of airtime around the
+  clock. Frames are now compressed with libavcodec's ALAC encoder. Digital
+  silence goes out as a 20-byte frame tuxplayd builds itself (no predictor, one
+  zero, then a run of 351 zeros), because the encoder stores the low byte of a
+  24-bit sample raw even when it is zero (740 bytes a frame). Measured to White
+  Right: silence 0.063 Mbit/s, a noise-like test signal 0.96 Mbit/s. At startup
+  both kinds of frame are decoded with libavcodec's ALAC decoder, set up the way
+  the receivers are, and anything not bit-exact falls back to uncompressed
+  frames. Lossless audio in a 24-bit stream keeps music above the Mac's lossy
+  0.47; the HomePods offer no 16-bit ALAC at 48 kHz.
+- **Volume on connect (fixed).** The Mac sends none and adopts the receiver's
+  level. tuxplayd now reads `initialVolume` from a plain `GET /info` before
+  pairing, takes the volume leader's as the output's volume, moves the desktop
+  slider to it, and sends volume only when it changes here.
+- **MediaRemote (fixed).** A tap on the HomePod sends `paus`, which tuxplayd took
+  for a takeover. Speaker commands (`play`, `paus`, `nitm`, `pitm`) now go to the
+  desktop's media player through `playerctl`, playback state follows the
+  desktop going quiet or audible so the next tap asks for the other, and only
+  the commands handled are advertised (play, pause, toggle, next, previous). A
+  takeover is the receiver closing the connection. Now-playing text and artwork
+  are not sent.
+- **Headers (fixed).** Client name and id now go only with pairing, and bodyless
+  requests carry no `Content-Length`, as the Mac sends them.
+- **Smaller ones, left as they are.** One stable UUID for client and timing-peer
+  id, delayed ACKs on the control connection, ECN, and RECORD and `/audioMode`,
+  which the Mac skips. All harmless as measured.
 
 ## Not done
 

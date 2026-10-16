@@ -32,20 +32,18 @@
 #define ANCHOR_RETRY_MAX 10
 
 // updateMRPlaybackState values
-#define MR_PLAYING 1
-#define MR_STOPPED 3
 // ~100 ms: time for the anchor round trip before the frame is due
 #define ANCHOR_RETRY_MARGIN_FRAMES 14
 
-static const uint32_t mrp_cmd_ids[] = {
-  0x61bd, 0x61bc, 0x95, 0x87, 0x86, 0x84, 0x83, 0x82, 0x81, 0x80, 0x7f,
-  0x7d, 0x7a, 0x1a, 0x19, 0x18, 0x16, 0x15, 0x13, 0x12, 0x11, 0x0a, 0x0b,
-  0x08, 0x09, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00
-};
+// The MediaRemote commands we act on (player.c passes them to the desktop's
+// media player): previous, next, toggle, pause, play. A Mac advertises only
+// what its current player supports.
+static const uint32_t mrp_cmd_ids[] = { 0x05, 0x04, 0x02, 0x01, 0x00 };
 
 enum step
 {
   STEP_CONNECT,
+  STEP_GET_INFO,
   STEP_PAIR_1,
   STEP_PAIR_2,
   STEP_SETUP_SESSION,
@@ -102,6 +100,11 @@ struct session
   int mr_state;       // last updateMRPlaybackState sent, 0 = none
   bool volume_sent;
   double volume_db;
+  bool have_initial_volume;
+  double initial_volume_db; // the receiver's own level when we connected
+  char client_id[37];
+  session_media_cb media_cb;
+  void *media_arg;
 
   struct event *feedback_ev;
   struct event *anchor_retry_ev;
@@ -165,16 +168,21 @@ session_fail(struct session *s, const char *why)
 static void
 add_default_headers(struct session *s)
 {
-  char client_id[37];
-
-  // As macOS 27 introduces itself (measured): its AirPlay version, a name and
-  // a stable client id, and none of the old iTunes remote-control headers
-  // (Client-Instance, DACP-ID, Active-Remote). The id is built from our MAC so
-  // it stays the same across restarts.
-  snprintf(client_id, sizeof(client_id), "00000000-0000-4000-8000-%s", s->pair_id);
+  // As macOS 27 sends them (measured): every request carries only CSeq and
+  // its AirPlay version; the name and a stable client id go with pairing (see
+  // pair_headers()). None of the old iTunes remote-control headers
+  // (Client-Instance, DACP-ID, Active-Remote).
   rtsp_conn_default_header_add(s->ctrl, "User-Agent", "AirPlay/980.77.5");
-  rtsp_conn_default_header_add(s->ctrl, "X-Apple-Client-Name", s->params.sender_name);
-  rtsp_conn_default_header_add(s->ctrl, "X-Apple-Client-ID", client_id);
+}
+
+// The id is built from our MAC so it stays the same across restarts
+static void
+pair_headers(struct session *s, struct rtsp_header hdr[3])
+{
+  snprintf(s->client_id, sizeof(s->client_id), "00000000-0000-4000-8000-%s", s->pair_id);
+  hdr[0] = (struct rtsp_header){ "X-Apple-HKP", "4" };
+  hdr[1] = (struct rtsp_header){ "X-Apple-Client-Name", s->params.sender_name };
+  hdr[2] = (struct rtsp_header){ "X-Apple-Client-ID", s->client_id };
 }
 
 /* -------------------------------- Feedback -------------------------------- */
@@ -543,17 +551,13 @@ event_request_handler(struct rtsp_conn *c, const struct rtsp_message *req, void 
   const char *type = px_get_str(p, "type");
   const char *value = px_get_str(p, "value");
 
+  // A tap on the speaker or a Siri request: for whatever is playing here. A
+  // takeover by another sender is the receiver closing the connection.
   if (type && strcmp(type, "sendMediaRemoteCommand") == 0 && value)
     {
-      log_info(MOD, "%s: event command: %s", s->receiver->name, value);
-      if (strcmp(value, "paus") == 0)
-        {
-          log_info(MOD, "%s: receiver asked us to stop (takeover)", s->receiver->name);
-          s->taken_over = true;
-          plist_free(p);
-          session_fail(s, "receiver takeover");
-          return 200;
-        }
+      log_info(MOD, "%s: media command %s", s->receiver->name, value);
+      if (s->media_cb)
+        s->media_cb(value, s->media_arg);
     }
 
   plist_free(p);
@@ -594,7 +598,7 @@ ctrl_event(struct rtsp_conn *c, enum rtsp_event ev, void *arg)
       else
         snprintf(s->session_url, sizeof(s->session_url), "rtsp://%s/%u", s->local_addr, session_id);
       s->ifindex = netwatch_ifindex_of(s->local_addr);
-      s->step = STEP_PAIR_1;
+      s->step = STEP_GET_INFO;
       step_advance(s);
       return;
     }
@@ -603,6 +607,32 @@ ctrl_event(struct rtsp_conn *c, enum rtsp_event ev, void *arg)
     s->taken_over = true;
   if (s->state < SESSION_FAILED)
     session_fail(s, s->taken_over ? "closed by the receiver (another sender?)" : "control connection lost");
+}
+
+// Before pairing, in plain text: only the receiver's current volume is used,
+// so we can adopt it rather than impose ours, as a Mac does
+static void
+get_info_response(struct rtsp_conn *c, const struct rtsp_message *resp, void *arg)
+{
+  struct session *s = arg;
+  plist_t p, v;
+
+  if (!resp)
+    {
+      session_fail(s, "GET /info timeout");
+      return;
+    }
+  if (resp->status == 200 && (p = px_from_bin(resp->body, resp->body_len)))
+    {
+      if ((v = plist_dict_get_item(p, "initialVolume")) && plist_get_node_type(v) == PLIST_REAL)
+        {
+          plist_get_real_val(v, &s->initial_volume_db);
+          s->have_initial_volume = true;
+        }
+      plist_free(p);
+    }
+  s->step = STEP_PAIR_1;
+  step_advance(s);
 }
 
 static void
@@ -903,12 +933,20 @@ tcp_connect_blocking(const char *address, uint16_t port, int timeout_ms)
 /* ----------------------------- Step machine ------------------------------ */
 
 static int
+send_get_info(struct session *s)
+{
+  return rtsp_request(s->ctrl, "GET", "/info", NULL, NULL, 0, NULL, 0,
+                      RTSP_TIMEOUT_MS, get_info_response, s);
+}
+
+static int
 send_pair_1(struct session *s)
 {
   size_t len;
   uint8_t *body;
-  struct rtsp_header hdr = { "X-Apple-HKP", "4" };
+  struct rtsp_header hdr[3];
 
+  pair_headers(s, hdr);
   s->pair_ctx = pair_setup_new(PAIR_CLIENT_HOMEKIT_TRANSIENT,
                                NULL, NULL, NULL, s->pair_id);
   if (!s->pair_ctx)
@@ -919,7 +957,7 @@ send_pair_1(struct session *s)
     return -1;
 
   int ret = rtsp_request(s->ctrl, "POST", "/pair-setup",
-                         "application/octet-stream", &hdr, 1,
+                         "application/octet-stream", hdr, 3,
                          body, len, RTSP_TIMEOUT_MS, pair_1_response, s);
   free(body);
   return ret;
@@ -930,14 +968,15 @@ send_pair_2(struct session *s)
 {
   size_t len;
   uint8_t *body;
-  struct rtsp_header hdr = { "X-Apple-HKP", "4" };
+  struct rtsp_header hdr[3];
 
+  pair_headers(s, hdr);
   body = pair_setup_request2(&len, s->pair_ctx);
   if (!body)
     return -1;
 
   int ret = rtsp_request(s->ctrl, "POST", "/pair-setup",
-                         "application/octet-stream", &hdr, 1,
+                         "application/octet-stream", hdr, 3,
                          body, len, RTSP_TIMEOUT_MS, pair_2_response, s);
   free(body);
   return ret;
@@ -1210,6 +1249,9 @@ step_advance(struct session *s)
 
   switch (s->step)
     {
+    case STEP_GET_INFO:
+      ret = send_get_info(s);
+      break;
     case STEP_PAIR_1:
       ret = send_pair_1(s);
       break;
@@ -1280,6 +1322,8 @@ session_start(struct event_base *evbase, struct receiver *r, const struct sessio
   s->params.sender_id = xstrdup(p->sender_id);
   s->params.group_uuid = xstrdup(p->group_uuid);
   s->params.clock_id = p->clock_id;
+  s->media_cb = p->media_cb;
+  s->media_arg = p->media_arg;
   peers_store(s, p->peers, p->npeers);
 
   s->pair_id = xstrdup(p->sender_id);
@@ -1323,6 +1367,21 @@ bool
 session_taken_over(const struct session *s)
 {
   return s->taken_over;
+}
+
+bool
+session_initial_volume(const struct session *s, double *db)
+{
+  if (s->have_initial_volume)
+    *db = s->initial_volume_db;
+  return s->have_initial_volume;
+}
+
+void
+session_playback_state(struct session *s, int state)
+{
+  if (s->state == SESSION_PLAYING)
+    playback_state_send(s, state);
 }
 
 int

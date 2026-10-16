@@ -1,6 +1,7 @@
 # tuxplayd - AirPlay 2 sender with a PipeWire sink clocked by the receivers' PTP time.
 
-PKGS     = libpipewire-0.3 libevent libevent_pthreads libsodium libplist-2.0 avahi-client openssl json-c
+PKGS     = libpipewire-0.3 libevent libevent_pthreads libsodium libplist-2.0 avahi-client openssl json-c \
+           libavcodec libavutil
 CC      ?= cc
 CFLAGS  ?= -O2 -g
 CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers \

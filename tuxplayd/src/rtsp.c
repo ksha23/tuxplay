@@ -598,7 +598,10 @@ rtsp_request(struct rtsp_conn *c, const char *method, const char *uri,
     evbuffer_add_printf(r->wire, "%s: %s\r\n", extra[i].name, extra[i].value);
   if (content_type)
     evbuffer_add_printf(r->wire, "Content-Type: %s\r\n", content_type);
-  evbuffer_add_printf(r->wire, "Content-Length: %zu\r\n\r\n", body_len);
+  // As a Mac sends it: no Content-Length on a request without a body
+  if (body_len)
+    evbuffer_add_printf(r->wire, "Content-Length: %zu\r\n", body_len);
+  evbuffer_add(r->wire, "\r\n", 2);
   if (body_len)
     evbuffer_add(r->wire, body, body_len);
 
