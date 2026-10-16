@@ -1,0 +1,13 @@
+[Unit]
+Description=Tuxplay: AirPlay 2 speakers as a PipeWire output
+After=pipewire.service
+Requires=pipewire.service
+PartOf=pipewire.service
+
+[Service]
+ExecStart=/usr/local/bin/tuxplayd
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
