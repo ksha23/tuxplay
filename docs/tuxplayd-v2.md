@@ -119,7 +119,7 @@ interfaces with NetworkManager while a stream played, tuxplayd never restarted.
   both kinds of frame are decoded with libavcodec's ALAC decoder, set up the way
   the receivers are, and anything not bit-exact falls back to uncompressed
   frames. Lossless audio in a 24-bit stream keeps music above the Mac's lossy
-  0.47; the HomePods offer no 16-bit ALAC at 48 kHz.
+  0.47, since the HomePods offer no 16-bit ALAC at 48 kHz.
 - **Volume on connect (fixed).** The Mac sends none and adopts the receiver's
   level. tuxplayd now reads `initialVolume` from a plain `GET /info` before
   pairing, takes the volume leader's as the output's volume, moves the desktop

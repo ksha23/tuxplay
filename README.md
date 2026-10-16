@@ -29,7 +29,7 @@ other AirPlay 2 receivers.
   Tuxplay steps aside and takes them back only when something new plays here.
 - **Holds the speakers, or lets them go.** By default Tuxplay keeps the speakers
   for as long as they are selected, as a Mac does. It can instead release them
-  after a chosen time without sound, so they go dark and are free; the next
+  after a chosen time without sound, so they go dark and are free. The next
   sound takes them back.
 - **Survives network changes.** Unplugging the cable, switching between Ethernet
   and Wi-Fi, or losing the network for a while needs no restart: sessions move to
