@@ -63,7 +63,7 @@ the wire.
 | Latency on Ethernet | about 290 ms | 250 ms lead, the whole delay (the HomePod states `arrivalToRenderLatencyMs` 4) |
 | Idle | streams silence, stays lit | the same (`-P` sets a pause instead), at 0.06 Mbit/s |
 | Volume on connect | adopts the speaker's | the same |
-| A tap on the speaker | pauses its player | pauses the desktop's player (MPRIS) |
+| A tap on the speaker | pauses its player, light stays on | pauses the desktop's player (MPRIS), light goes out |
 | Another sender takes over | the Mac switches its output away | stands down, takes the speakers back when something new plays |
 
 The stream type is the one real difference. Realtime APAT is undocumented and
@@ -124,13 +124,26 @@ interfaces with NetworkManager while a stream played, tuxplayd never restarted.
   level. tuxplayd now reads `initialVolume` from a plain `GET /info` before
   pairing, takes the volume leader's as the output's volume, moves the desktop
   slider to it, and sends volume only when it changes here.
-- **MediaRemote (fixed).** A tap on the HomePod sends `paus`, which tuxplayd took
-  for a takeover. Speaker commands (`play`, `paus`, `nitm`, `pitm`) now go to the
-  desktop's media player through `playerctl`, playback state follows the
-  desktop going quiet or audible so the next tap asks for the other, and only
-  the commands handled are advertised (play, pause, toggle, next, previous). A
-  takeover is the receiver closing the connection. Now-playing text and artwork
-  are not sent.
+- **MediaRemote (fixed, one difference left).** A tap on the HomePod sends
+  `paus`, which tuxplayd took for a takeover. Speaker commands (`play`, `paus`,
+  `nitm`, `pitm`) now go to the desktop's media player through `playerctl`, and
+  only those are advertised (play, pause, toggle, next, previous). A takeover is
+  the receiver closing the connection. Now-playing text and artwork are not
+  sent.
+  - On a tap, the Mac (log, 2026-10-16) forwards Pause or Play to its playing
+    app and sends `updateMRNowPlayingInfo`, nothing else. Its realtime stream
+    carries on and the light stays on.
+  - On a buffered stream, a tap also pauses the receiver's own rendering, which
+    only a new anchor ends. A first version left the tapped speaker silent for
+    good. tuxplayd now re-anchors every member on each tap, so playback resumes
+    together.
+  - The light still goes out on a tap. Not flushing, re-anchoring at once and
+    re-sending `updateMRPlaybackState` playing all left it dark. What the
+    light follows on a buffered stream is unknown.
+  - Separately, the light does follow `updateMRPlaybackState`: reporting
+    "paused" whenever the desktop went quiet turned it off. tuxplayd reports
+    "playing" for as long as it holds the speakers, as the Mac's lights show.
+
 - **Headers (fixed).** Client name and id now go only with pairing, and bodyless
   requests carry no `Content-Length`, as the Mac sends them.
 - **Smaller ones, left as they are.** One stable UUID for client and timing-peer

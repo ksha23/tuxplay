@@ -97,6 +97,7 @@ struct session
   bool network_lost;  // its local address or link went away
   int ifindex;        // interface our end of the control connection is on
   bool pausing;
+  bool pause_reported; // tell the receiver it is paused once the flush is done
   int mr_state;       // last updateMRPlaybackState sent, 0 = none
   bool volume_sent;
   double volume_db;
@@ -261,12 +262,15 @@ flush_response(struct rtsp_conn *c, const struct rtsp_message *resp, void *arg)
       session_fail(s, resp ? "FLUSHBUFFERED rejected" : "FLUSHBUFFERED timeout");
       return;
     }
-  playback_state_send(s, MR_STOPPED);
+  // Paused, not stopped: a tap on the speaker then asks to play. A flush
+  // that is only a re-anchor says nothing, or the speaker's light would blink.
+  if (s->pause_reported)
+    playback_state_send(s, MR_PAUSED);
   set_state(s, SESSION_READY);
 }
 
 int
-session_pause(struct session *s)
+session_pause(struct session *s, bool report)
 {
   plist_t p;
   uint8_t *body;
@@ -293,6 +297,7 @@ session_pause(struct session *s)
 
   log_info(MOD, "%s: pausing at frame %llu", s->receiver->name, (unsigned long long)head);
   s->pausing = true;
+  s->pause_reported = report;
   ret = rtsp_request(s->ctrl, "FLUSHBUFFERED", s->session_url, "application/x-apple-binary-plist", NULL, 0,
                      body, body_len, RTSP_TIMEOUT_MS, flush_response, s);
   free(body);
@@ -557,7 +562,7 @@ event_request_handler(struct rtsp_conn *c, const struct rtsp_message *req, void 
     {
       log_info(MOD, "%s: media command %s", s->receiver->name, value);
       if (s->media_cb)
-        s->media_cb(value, s->media_arg);
+        s->media_cb(s, value, s->media_arg);
     }
 
   plist_free(p);
@@ -1377,12 +1382,6 @@ session_initial_volume(const struct session *s, double *db)
   return s->have_initial_volume;
 }
 
-void
-session_playback_state(struct session *s, int state)
-{
-  if (s->state == SESSION_PLAYING)
-    playback_state_send(s, state);
-}
 
 int
 session_ifindex(const struct session *s)

@@ -26,8 +26,10 @@ enum session_state
 #define MR_PAUSED  2
 #define MR_STOPPED 3
 
+struct session;
+
 // A MediaRemote command from the receiver ("play", "paus", "nitm", "pitm")
-typedef void (*session_media_cb)(const char *cmd, void *arg);
+typedef void (*session_media_cb)(struct session *s, const char *cmd, void *arg);
 
 struct session_params
 {
@@ -55,11 +57,12 @@ session_start(struct event_base *evbase, struct receiver *r, const struct sessio
 int
 session_anchor(struct session *s, uint64_t frame, int64_t render_gm_ns, uint64_t gm_id);
 
-// Stop playing (FLUSHBUFFERED) but keep the session: the receiver goes idle
-// and other senders can use it. Back in SESSION_READY once it agrees, ready
-// for the next session_anchor().
+// Stop playing (FLUSHBUFFERED) but keep the session. Back in SESSION_READY
+// once the receiver agrees, ready for the next session_anchor(). report: tell
+// it it is paused (its light goes out); false for a flush that only re-anchors.
 int
-session_pause(struct session *s);
+session_pause(struct session *s, bool report);
+
 
 // -30..0 dB, or -144 for silent
 int
@@ -87,10 +90,6 @@ session_taken_over(const struct session *s);
 bool
 session_initial_volume(const struct session *s, double *db);
 
-// What the receiver shows: MR_PLAYING or MR_PAUSED. Sent only while playing,
-// and only on a change.
-void
-session_playback_state(struct session *s, int state);
 
 enum session_state
 session_state(const struct session *s);

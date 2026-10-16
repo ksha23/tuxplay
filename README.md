@@ -21,6 +21,7 @@ other AirPlay 2 receivers.
   pair's leader, as a Mac does.
 - **Tap to pause.** A tap on a HomePod, or asking Siri to pause, skip or go back,
   controls the player on the desktop (through MPRIS), as it controls a Mac's.
+  Unlike with a Mac, the speaker's light goes out on a tap.
 - **Light on the network.** Audio is compressed ALAC, lossless, and silence costs
   almost nothing (about 0.06 Mbit/s per speaker), which matters because the
   speakers themselves are on Wi-Fi.

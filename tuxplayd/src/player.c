@@ -61,6 +61,7 @@ static struct
 } pl;
 
 static void session_state_changed(struct session *sess, enum session_state state, void *arg);
+static void check_schedule(int delay_ms);
 
 static double
 volume_to_db(int volume)
@@ -82,11 +83,29 @@ db_to_volume(double db)
 
 extern char **environ;
 
-// A tap on a speaker, or Siri: passed to the desktop's media player over
-// MPRIS, as a Mac passes it to its now-playing app
+// Flush every member without telling them they are paused, so the check
+// anchors them all again on one frame
 static void
-media_command(const char *cmd, void *arg)
+output_reanchor(struct output *out)
 {
+  for (int i = 0; i < out->nmembers; i++)
+    if (out->members[i]->session)
+      session_pause(out->members[i]->session, false);
+  check_schedule(0);
+}
+
+// A tap on a speaker, or Siri. The command goes to the desktop's media
+// player over MPRIS, as a Mac passes it to its now-playing app. A Mac's
+// realtime stream simply carries on, so its speakers stay lit. On this
+// buffered stream a tap also pauses the speaker's own rendering, which only
+// a new anchor ends, so the output is anchored again at once: the speakers
+// keep rendering (the paused player's silence, then the music) and stay lit.
+static void
+media_command(struct session *sess, const char *cmd, void *arg)
+{
+  struct receiver *r = session_receiver(sess);
+  struct output *out = r ? r->output : NULL;
+
   static const struct { const char *airplay, *mpris; } map[] = {
     { "paus", "pause" }, { "play", "play" }, { "nitm", "next" }, { "pitm", "previous" },
   };
@@ -98,6 +117,9 @@ media_command(const char *cmd, void *arg)
       verb = map[i].mpris;
   if (!verb)
     return;
+
+  if (out && (strcmp(cmd, "paus") == 0 || strcmp(cmd, "play") == 0))
+    output_reanchor(out);
 
   char *argv[] = { "playerctl", (char *)verb, NULL };
   if (posix_spawnp(&pid, "playerctl", NULL, NULL, argv, environ) != 0)
@@ -356,7 +378,7 @@ output_check(struct output *out, const struct timeline_snapshot *snap, bool *ptp
       // Pausing on silence: the speakers go idle, the sessions stay
       if (playing)
         for (int i = 0; i < out->nmembers; i++)
-          session_pause(out->members[i]->session);
+          session_pause(out->members[i]->session, true);
       return;
     }
 
@@ -427,7 +449,7 @@ timeline_cb(evutil_socket_t fd, short what, void *arg)
           if (!logged)
             log_info(MOD, "Timeline changed (now %016llx), re-anchoring", (unsigned long long)snap.gm_id);
           logged = true;
-          session_pause(sess);
+          session_pause(sess, false);
         }
   evtimer_add(pl.timeline_ev, &tv);
 }
@@ -517,11 +539,6 @@ activity_cb(bool audible, uint64_t frame, void *arg)
           out->claimed = true;
     }
 
-  // The speakers show playing or paused, so a tap on them asks for the other
-  for (out = devices_outputs(); out; out = out->next)
-    for (int i = 0; i < out->nmembers; i++)
-      if (out->members[i]->session)
-        session_playback_state(out->members[i]->session, audible ? MR_PLAYING : MR_PAUSED);
   check_schedule(0);
   if (!audible && pl.cfg.idle_release_s > 0)
     check_schedule(MAX(pl.cfg.idle_release_s * 1000 - silence_detect_ms(), 0) + 50);
@@ -723,7 +740,7 @@ player_lead_set(int ms)
   for (out = devices_outputs(); out; out = out->next)
     for (int i = 0; i < out->nmembers; i++)
       if (out->members[i]->session)
-        session_pause(out->members[i]->session);
+        session_pause(out->members[i]->session, false);
   return 0;
 }
 
