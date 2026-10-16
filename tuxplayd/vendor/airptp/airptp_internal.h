@@ -124,6 +124,7 @@ struct airptp_follower
   int master; // index in foreign, -1 if we are grandmaster
   int64_t master_since_ns;
   int64_t first_peer_ns; // start of the current run of peers, 0 if none
+  int64_t peers_gone_ns; // when the last peer went, while the lock is kept for a reconnect
 
   bool sync_pending;
   uint16_t sync_seq;

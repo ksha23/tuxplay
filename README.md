@@ -19,6 +19,9 @@ other AirPlay 2 receivers.
   volume. For a pair, it goes to the pair's leader, as a Mac does.
 - **Shares with other devices.** A phone or Mac can take the speakers at any time.
   Tuxplay steps aside and takes them back only when something new plays here.
+- **Survives network changes.** Unplugging the cable, switching between Ethernet
+  and Wi-Fi, or losing the network for a while needs no restart: sessions move to
+  whatever is still up, usually within two seconds.
 - **Three ways to control it:** a top bar icon, a web page and a CLI.
 
 ## Install
@@ -102,6 +105,14 @@ of your Home. The pairing and stream code is vendored from
 
 - **Selected but silent.** Another device may be holding the speakers. Play
   something new here, or select the speakers again, to take them back.
+- **On Wi-Fi.** NetworkManager's Wi-Fi power saving holds traffic for up to a
+  few hundred ms. If sound drops out on Wi-Fi, turn it off with a file
+  `/etc/NetworkManager/conf.d/wifi-powersave.conf` containing
+  `[connection]` and `wifi.powersave = 2`.
+- **Ethernet and Wi-Fi on the same network at once.** Set
+  `net.ipv4.conf.all.arp_ignore = 1` and `net.ipv4.conf.all.arp_announce = 2`
+  (in `/etc/sysctl.d/`). Without them each card answers for the other's address,
+  and NetworkManager can bring a reconnected card up without routes.
 - **Logs.** `journalctl --user -u tuxplayd -f`. For protocol detail, stop the
   service and run `tuxplayd -v` in a terminal.
 - **State.** `curl -s localhost:3689/api/status` and

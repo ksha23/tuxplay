@@ -59,6 +59,8 @@ SOFTWARE.
 #define FOLLOW_WINDOW_NS (4 * NS_PER_SEC)
 // Beyond this the published timeline is stepped instead of slewed
 #define FOLLOW_STEP_NS (20 * 1000000LL)
+// How long the lock outlives the last peer, for sessions that reconnect
+#define PEERS_GONE_GRACE_NS (10 * NS_PER_SEC)
 // A remaining error is worked off over this long, bending the rate by at most
 // this much (200 ppm is inaudible)
 #define FOLLOW_SLEW_SECS 5.0
@@ -958,16 +960,28 @@ ptp_follower_peers_changed(struct airptp_daemon *daemon)
   else if (daemon->num_peers == 0)
     f->first_peer_ns = 0;
 
-  // With no receivers left nothing keeps the lock current (the timers stop),
-  // and a receiver's next session comes on a new PTP port anyway: start the
-  // next one from nothing rather than from a mapping gone stale
+  // With no receivers left nothing keeps the lock current (the timers stop).
+  // Sessions that reconnect at once (after a network change) bring the same
+  // grandmaster back, so keep the lock for a moment and only start from
+  // nothing when they took longer, rather than from a mapping gone stale.
   if (daemon->num_peers == 0 && f->master >= 0)
     {
-      airptp_logmsg("PTP: last peer removed, dropping the lock on grandmaster %016" PRIx64, f->foreign[f->master].gm_id);
-      f->master = -1;
-      follower_samples_clear(f);
-      timeline_publish(daemon, false, 0, 0, 0);
+      if (!f->peers_gone_ns)
+	f->peers_gone_ns = mono_ns();
       return;
+    }
+  if (daemon->num_peers > 0 && f->peers_gone_ns)
+    {
+      bool stale = mono_ns() - f->peers_gone_ns > PEERS_GONE_GRACE_NS;
+
+      f->peers_gone_ns = 0;
+      if (stale && f->master >= 0)
+	{
+	  airptp_logmsg("PTP: no peers for a while, dropping the lock on grandmaster %016" PRIx64, f->foreign[f->master].gm_id);
+	  f->master = -1;
+	  follower_samples_clear(f);
+	  timeline_publish(daemon, false, 0, 0, 0);
+	}
     }
 
   pthread_mutex_lock(&daemon->timeline_lck);

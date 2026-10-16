@@ -86,4 +86,16 @@ session_receiver(const struct session *s);
 const char *
 session_local_address(const struct session *s);
 
+// The interface our end is on, 0 if unknown
+int
+session_ifindex(const struct session *s);
+
+// Our address or link under the session went away: fail it now rather than
+// wait for a keep-alive to time out
+void
+session_network_lost(struct session *s);
+
+bool
+session_lost_network(const struct session *s);
+
 #endif

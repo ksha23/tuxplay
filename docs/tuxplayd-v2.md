@@ -56,7 +56,8 @@ the wire.
 | | macOS 27 | tuxplayd |
 |---|---|---|
 | Pairing | HomeKit pair-verify (`HKP 6`) | HomeKit transient (`HKP 4`), the method for senders outside the Home |
-| Headers, keep-alive, CSeq | as above | the same |
+| Headers | client headers on `/pair-verify` only, then just CSeq and User-Agent | the same values, but on every request |
+| Keep-alive, CSeq | as above | the same |
 | PTP | follower, Delay_Req to every member, no Signaling | the same. The HomePods then treat both senders alike, announcing once a second (to a sender that skips a member's Delay_Req, that member announces four times a second) |
 | Stream | realtime APAT, adaptive latency | buffered ALAC over TCP, fixed lead |
 | Latency on Ethernet | about 290 ms | 250 ms lead, the whole delay (the HomePod states `arrivalToRenderLatencyMs` 4) |
@@ -79,6 +80,43 @@ has no Wi-Fi Aware data path yet (it is arriving in kernel 7.1 and hostap).
   `ProcessLatency` is ignored, a port `Latency` param is what clients read.
 - **v1's helpers driving v2.** tuxplay-share kept selecting and deselecting
   outputs through the API, which tuxplayd answers like owntone did. They are gone.
+
+## Network changes
+
+Tested on north (wired RTL8125B and Wi-Fi MT7921K on the same LAN) by switching
+interfaces with NetworkManager while a stream played, tuxplayd never restarted.
+
+- **What it does.** tuxplayd watches the kernel's address and link events
+  (netlink). A session whose local address or link goes away is failed at once
+  and reconnected 200 ms later (1 s after a link loses its carrier, since its
+  address and route go only after that). The PTP lock is kept for 10 s after the
+  last peer goes, so reconnecting sessions do not wait to relock. A speaker
+  withdrawn by mDNS on one interface stays present while another interface sees
+  it, and after a network loss its last address is tried before mDNS finds it
+  again. A new local address triggers an immediate retry.
+- **Measured.** Losing the interface in use: sound back after about 1.6 s.
+  Both interfaces down for 10 s, then Wi-Fi back: sound back 2 s after Wi-Fi
+  reconnected (11 s before the address and retry changes). Adding an interface
+  while playing: no interruption.
+- **Found on the way.** With both cards on one subnet and the kernel's default
+  ARP settings, each card answers ARP for the other's address. NetworkManager's
+  duplicate-address check then reports a conflict with the machine's own Wi-Fi
+  MAC and brings a reconnected Ethernet up without routes. `arp_ignore = 1` and
+  `arp_announce = 2` fix it.
+
+## Found by an independent comparison, not yet done
+
+- **Bitrate.** tuxplayd's ALAC frames are uncompressed: 2.31 Mbit/s per receiver,
+  the same in silence. The Mac's realtime AAC-ELD runs at 0.47 Mbit/s. The
+  HomePods are on Wi-Fi, so a held pair costs 4.6 Mbit/s of airtime. Real ALAC
+  coding would fix it, and a silent frame would drop under 100 bytes.
+- **Volume on connect.** The Mac sends none and adopts the receiver's
+  `initialVolume`. tuxplayd sends its saved level, overriding Siri or the Home app.
+- **MediaRemote.** A tap on the HomePod sends `paus`, which tuxplayd treats as a
+  takeover. The Mac pauses its player instead and keeps the pair. The Mac also
+  sends now-playing info and advertises only the commands its player supports.
+- **Smaller ones.** One stable UUID for client and timing-peer id, delayed ACKs
+  on the control connection, ECN, and RECORD and `/audioMode`, which the Mac skips.
 
 ## Not done
 

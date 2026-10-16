@@ -36,6 +36,10 @@ struct receiver
   char *addr6;
   uint16_t port;
   bool present;
+  // Interfaces the service is currently seen on, one bit per ifindex, per
+  // protocol: a receiver is only gone once no interface sees it
+  uint64_t seen4;
+  uint64_t seen6;
 
   struct output *output;
   struct session *session;
@@ -79,6 +83,11 @@ devices_receivers(void);
 // A stereo pair is ready to start once both halves are present
 bool
 output_ready(const struct output *out);
+
+// Every member has a last known address, present or not: enough to try
+// reconnecting an output whose sessions our own network change cut
+bool
+output_reachable(const struct output *out);
 
 // The member volume goes to. macOS sends a pair's volume to one member, its
 // "volume leader", and lets the pair carry it to the other.

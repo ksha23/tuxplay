@@ -8,6 +8,7 @@
 #include <json-c/json.h>
 
 #include "devices.h"
+#include "netwatch.h"
 #include "sink.h"
 
 // Ties outputs, sessions and the audio timeline together. Selecting an output
@@ -39,6 +40,10 @@ player_output_select(struct output *out, bool selected);
 
 int
 player_output_volume(struct output *out, int volume);
+
+// netwatch.c: a local address went or came, or a link went down
+void
+player_network_changed(enum netwatch_event ev, const char *addr, int ifindex, void *arg);
 
 // The desktop slider moved (sink.c)
 void

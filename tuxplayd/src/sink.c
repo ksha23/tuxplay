@@ -385,6 +385,10 @@ sink_start(const struct sink_config *cfg, sink_audio_cb audio_cb, sink_volume_cb
   snprintf(latency, sizeof(latency), "%u/%u", cfg->quantum, SINK_RATE);
 
   props = pw_properties_new(
+    // The realtime client config loads libpipewire-module-rt, so the data
+    // thread that produces every cycle runs at realtime priority like
+    // PipeWire's own; the stock client config does not
+    PW_KEY_CONFIG_NAME, "client-rt.conf",
     PW_KEY_MEDIA_TYPE, "Audio",
     PW_KEY_MEDIA_CLASS, "Audio/Sink",
     PW_KEY_NODE_NAME, cfg->node_name,

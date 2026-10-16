@@ -11,6 +11,7 @@
 #include "devices.h"
 #include "log.h"
 #include "mdns.h"
+#include "netwatch.h"
 #include "player.h"
 #include "sink.h"
 #include "stream.h"
@@ -128,6 +129,10 @@ main(int argc, char **argv)
   if (api_start(evbase, api_addr, api_port) < 0)
     return 1;
 
+  // Without it a network change is still survived, only more slowly (a
+  // keep-alive has to time out first)
+  netwatch_start(evbase, player_network_changed, NULL);
+
   ev_sink = event_new(evbase, sink_notify_fd(), EV_READ | EV_PERSIST, sink_ev_cb, NULL);
   event_add(ev_sink, NULL);
   ev_mdns = event_new(evbase, mdns_notify_fd(), EV_READ | EV_PERSIST, mdns_ev_cb, NULL);
@@ -144,6 +149,7 @@ main(int argc, char **argv)
 
   log_info(MOD, "Shutting down");
   player_stop();
+  netwatch_stop();
   api_stop();
   mdns_stop();
   sink_stop();

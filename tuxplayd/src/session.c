@@ -16,6 +16,7 @@
 
 #include "pair.h"
 #include "log.h"
+#include "netwatch.h"
 #include "plistx.h"
 #include "rtsp.h"
 #include "session.h"
@@ -95,6 +96,8 @@ struct session
   uint32_t ptp_peer;
   bool have_ptp_peer;
   bool taken_over;
+  bool network_lost;  // its local address or link went away
+  int ifindex;        // interface our end of the control connection is on
   bool pausing;
   int mr_state;       // last updateMRPlaybackState sent, 0 = none
   bool volume_sent;
@@ -590,6 +593,7 @@ ctrl_event(struct rtsp_conn *c, enum rtsp_event ev, void *arg)
         snprintf(s->session_url, sizeof(s->session_url), "rtsp://[%s]/%u", s->local_addr, session_id);
       else
         snprintf(s->session_url, sizeof(s->session_url), "rtsp://%s/%u", s->local_addr, session_id);
+      s->ifindex = netwatch_ifindex_of(s->local_addr);
       s->step = STEP_PAIR_1;
       step_advance(s);
       return;
@@ -1319,6 +1323,25 @@ bool
 session_taken_over(const struct session *s)
 {
   return s->taken_over;
+}
+
+int
+session_ifindex(const struct session *s)
+{
+  return s->ifindex;
+}
+
+void
+session_network_lost(struct session *s)
+{
+  s->network_lost = true;
+  session_fail(s, "its network went away");
+}
+
+bool
+session_lost_network(const struct session *s)
+{
+  return s->network_lost;
 }
 
 // Closing the connections is the teardown: no TEARDOWN is sent (a receiver

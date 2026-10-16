@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 
 #include <json-c/json.h>
+#include <net/if.h>
 
 #include "devices.h"
 #include "log.h"
@@ -57,6 +58,23 @@ features_parse(const char *s)
   if (*end == ',')
     hi = strtoull(end + 1, NULL, 16);
   return lo | (hi << 32);
+}
+
+static uint64_t
+if_bit(int ifindex)
+{
+  return 1ULL << (ifindex > 0 && ifindex < 64 ? ifindex : 63);
+}
+
+// A scoped link-local address ("fe80::1%enp7s0") is only usable through its
+// own interface
+static bool
+addr_on_if(const char *addr, int ifindex)
+{
+  char name[IF_NAMESIZE];
+  const char *scope = addr ? strchr(addr, '%') : NULL;
+
+  return scope && if_indextoname((unsigned)ifindex, name) && strcmp(scope + 1, name) == 0;
 }
 
 static bool
@@ -162,12 +180,21 @@ devices_mdns_cb(const struct mdns_service *svc, bool removed, void *arg)
     {
       if (!r)
         return;
+      // Gone from one interface (a cable unplugged, Wi-Fi off) is not gone:
+      // the same receiver is often still seen on another
       if (svc->ipv6)
-        replace(&r->addr6, NULL);
+        {
+          r->seen6 &= ~if_bit(svc->ifindex);
+          if (addr_on_if(r->addr6, svc->ifindex))
+            replace(&r->addr6, NULL);
+        }
       else
-        replace(&r->addr4, NULL);
+        r->seen4 &= ~if_bit(svc->ifindex);
+      // The address is kept: when our own network is what went away, it is
+      // still the best guess for reconnecting once it is back (see
+      // output_reachable())
       was_present = r->present;
-      r->present = (r->addr4 || r->addr6);
+      r->present = (r->seen4 || r->seen6);
       if (was_present && !r->present)
         {
           log_info(MOD, "Receiver '%s' gone", r->name);
@@ -204,6 +231,11 @@ devices_mdns_cb(const struct mdns_service *svc, bool removed, void *arg)
   if ((v = mdns_txt_get(svc, "gcgl")))
     r->gcgl = txt_bool(v);
   r->port = svc->port;
+
+  if (svc->ipv6)
+    r->seen6 |= if_bit(svc->ifindex);
+  else
+    r->seen4 |= if_bit(svc->ifindex);
 
   // Prefer a global or ULA IPv6 address over a link-local one; keep IPv4 as is
   if (svc->ipv6)
@@ -248,6 +280,22 @@ output_ready(const struct output *out)
   for (i = 0; i < out->nmembers; i++)
     if (!receiver_usable(out->members[i]))
       return false;
+  return true;
+}
+
+// Every member has an address we last saw it at, whether or not mDNS sees it
+// right now
+bool
+output_reachable(const struct output *out)
+{
+  if (out->nmembers == 0 || (out->is_pair && out->nmembers < 2))
+    return false;
+  for (int i = 0; i < out->nmembers; i++)
+    {
+      const struct receiver *r = out->members[i];
+      if (!receiver_address(r) || !(r->features & FEATURE_BUFFERED_AUDIO) || !(r->features & FEATURE_PTP))
+        return false;
+    }
   return true;
 }
 

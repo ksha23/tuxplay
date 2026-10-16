@@ -22,6 +22,11 @@
 #endif
 
 #define RESTART_DELAY_MS 5000
+// After our own network changed. An address removal comes after its route is
+// gone, so the reconnect can follow at once. A link losing its carrier comes
+// first, and its address and route only go a moment later.
+#define ADDRESS_GONE_RECONNECT_MS 200
+#define LINK_DOWN_RECONNECT_MS    1000
 // Digital silence that ends a run of sound: new sound after this lets
 // tuxplayd take the speakers back from another sender
 #define SILENCE_MS       2000
@@ -46,6 +51,8 @@ static struct
   bool audible;
   uint64_t audible_frame;   // first audible frame of the current run
   int64_t restart_after_ns; // a failed output is not restarted before this
+  int network_reconnect_ms;  // delay after the latest network change
+  bool network_retry;        // reconnect outputs mDNS cannot see yet
 
   int sync_ms;        // A/V correction: < 0 when the sound is late against the picture
   bool slider_synced; // the desktop slider has been set from a saved volume
@@ -170,7 +177,9 @@ output_start(struct output *out)
   const char *peers[GROUP_MAX];
   char group_uuid[37];
 
-  if (!output_ready(out) || output_has_sessions(out))
+  // After our own network changed, the speakers' last addresses are tried
+  // before mDNS has found them again, which takes several seconds
+  if (output_has_sessions(out) || !(output_ready(out) || (pl.network_retry && output_reachable(out))))
     return;
 
   // One group id for everything started together, as a Mac does
@@ -215,6 +224,7 @@ output_anchor(struct output *out, const struct timeline_snapshot *snap)
     frame = pl.audible_frame;
   render_gm_ns = stream_frame_gm(frame) + lead_ns + offset_ns;
 
+  pl.network_retry = false;
   log_info(MOD, "%s: anchoring %d member(s) at frame %llu, renders in %lld ms (lead %d ms)",
            out->name, out->nmembers, (unsigned long long)frame,
            (long long)((render_gm_ns - now_gm) / 1000000), pl.cfg.lead_ms);
@@ -229,7 +239,7 @@ output_anchor(struct output *out, const struct timeline_snapshot *snap)
 static void
 output_check(struct output *out, const struct timeline_snapshot *snap, bool *ptp_wait)
 {
-  bool failed = false, taken = false;
+  bool failed = false, taken = false, lost_net = false;
   int n = 0, ready = 0, playing = 0;
 
   for (int i = 0; i < out->nmembers; i++)
@@ -245,6 +255,7 @@ output_check(struct output *out, const struct timeline_snapshot *snap, bool *ptp
         case SESSION_STOPPED:
           failed = true;
           taken |= session_taken_over(sess);
+          lost_net |= session_lost_network(sess);
           break;
         case SESSION_READY:
           ready++;
@@ -270,9 +281,15 @@ output_check(struct output *out, const struct timeline_snapshot *snap, bool *ptp
         }
       else if (out->claimed)
         {
-          log_info(MOD, "%s: lost, reconnecting in %d s", out->name, RESTART_DELAY_MS / 1000);
-          pl.restart_after_ns = mono_ns() + RESTART_DELAY_MS * 1000000LL;
-          check_schedule(RESTART_DELAY_MS);
+          int delay = lost_net ? pl.network_reconnect_ms : RESTART_DELAY_MS;
+
+          if (lost_net)
+            pl.network_retry = true;
+
+          log_info(MOD, "%s: %s, reconnecting in %d ms", out->name,
+                   lost_net ? "our network changed" : "lost", delay);
+          pl.restart_after_ns = mono_ns() + delay * 1000000LL;
+          check_schedule(delay);
         }
       return;
     }
@@ -374,6 +391,43 @@ timeline_cb(evutil_socket_t fd, short what, void *arg)
           session_pause(sess);
         }
   evtimer_add(pl.timeline_ev, &tv);
+}
+
+// A local address was removed, or a link went down: sessions on it are dead
+// even if their sockets do not know yet. A new address may mean the network
+// is back: retry what is waiting at once rather than on the next tick.
+void
+player_network_changed(enum netwatch_event ev, const char *addr, int ifindex, void *arg)
+{
+  struct output *out;
+
+  if (ev == NETWATCH_ADDR_NEW)
+    {
+      for (out = devices_outputs(); out; out = out->next)
+        if (out->selected && out->claimed && !output_has_sessions(out))
+          {
+            // The address comes a moment before its routes
+            pl.restart_after_ns = mono_ns() + ADDRESS_GONE_RECONNECT_MS * 1000000LL;
+            check_schedule(ADDRESS_GONE_RECONNECT_MS);
+            break;
+          }
+      return;
+    }
+
+  for (out = devices_outputs(); out; out = out->next)
+    for (int i = 0; i < out->nmembers; i++)
+      {
+        struct session *sess = out->members[i]->session;
+
+        if (!sess || session_state(sess) == SESSION_FAILED || session_state(sess) == SESSION_STOPPED)
+          continue;
+        if (addr ? strcmp(session_local_address(sess), addr) == 0
+                 : (ifindex > 0 && session_ifindex(sess) == ifindex))
+          {
+            pl.network_reconnect_ms = addr ? ADDRESS_GONE_RECONNECT_MS : LINK_DOWN_RECONNECT_MS;
+            session_network_lost(sess);
+          }
+      }
 }
 
 static void
