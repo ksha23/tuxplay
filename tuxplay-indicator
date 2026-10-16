@@ -32,7 +32,7 @@ except (ValueError, ImportError):
 from gi.repository import GLib, Gtk, Pango
 
 UI = os.environ.get("TUXPLAY_UI", "http://localhost:8730")
-OWNTONE = os.environ.get("TUXPLAY_API", "http://localhost:3689")
+API = os.environ.get("TUXPLAY_API", "http://localhost:3689")
 TUXPLAY = "/usr/local/bin/tuxplay"
 REFRESH_SECONDS = 3
 
@@ -85,13 +85,13 @@ def get_state():
 def set_output(oid, on):
     sh("curl -s --max-time 8 -X PUT -H 'Content-Type: application/json'"
        " -d '{\"selected\":%s}' %s/api/outputs/%s"
-       % ("true" if on else "false", OWNTONE, oid), timeout=15)
+       % ("true" if on else "false", API, oid), timeout=15)
 
 
 # Nothing that waits on another process may run on the GTK thread. The menu is
 # served to the shell over D-Bus from this thread, so while it sits in curl the
-# top bar menu cannot open or respond; selecting a speaker blocks until owntone
-# has finished connecting to it, several seconds when a speaker is retried.
+# top bar menu cannot open or respond; selecting a speaker blocks until tuxplayd
+# has answered, which can take seconds when a speaker is slow to connect.
 # Commands go through one worker so they keep the order they were clicked in.
 _commands = queue.Queue()
 
@@ -153,18 +153,6 @@ class Panel(Gtk.Window):
         self.device_rows = {}
         outer.pack_start(self.devices, False, False, 0)
 
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        lbl = Gtk.Label(xalign=0, label="Keep speakers ready")
-        self.hold = Gtk.Switch()
-        self.hold.set_tooltip_text(
-            "On: the connection stays open, so playback starts immediately.\n"
-            "Off: dropped when idle; the next play takes about 1.4 s.")
-        self.hold_handler = self.hold.connect("notify::active", self.on_hold)
-        row.pack_start(lbl, True, True, 0)
-        row.pack_start(self.hold, False, False, 0)
-        row.set_margin_bottom(16)
-        outer.pack_start(row, False, False, 0)
-
         outer.pack_start(self._label("DELAY"), False, False, 0)
         self.delay_value = Gtk.Label(xalign=0)
         outer.pack_start(self.delay_value, False, False, 0)
@@ -174,17 +162,17 @@ class Panel(Gtk.Window):
         outer.pack_start(self.scale, False, False, 0)
 
         hint = Gtk.Label(xalign=0)
-        hint.set_markup('<span size="small" alpha="65%">Lower is snappier. '
-                        'Applying reconnects the speakers, so do it with nothing playing.</span>')
+        hint.set_markup('<span size="small" alpha="65%">Lower is snappier. Takes effect at once: '
+                        'what is playing pauses for a moment.</span>')
         hint.set_line_wrap(True)
         hint.set_max_width_chars(42)
         outer.pack_start(hint, False, False, 0)
 
         # Nothing is applied until you say so, and an unapplied edit is thrown
-        # away when the window closes. Applying restarts owntone, so it should
-        # never happen as a side effect of dragging past a value.
+        # away when the window closes. Applying re-anchors what is playing, so
+        # it should never happen as a side effect of dragging past a value.
         drow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        drow.set_margin_top(8); drow.set_margin_bottom(16)
+        drow.set_margin_top(8)
         self.btn_apply = Gtk.Button(label="Apply delay")
         self.btn_apply.get_style_context().add_class("suggested-action")
         self.btn_apply.set_sensitive(False)
@@ -197,20 +185,6 @@ class Panel(Gtk.Window):
         drow.pack_start(self.btn_reset, True, True, 0)
         outer.pack_start(drow, False, False, 0)
 
-        outer.pack_start(self._label("PICTURE AND SOUND"), False, False, 0)
-        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, homogeneous=True)
-        for text, args, tip in (
-                ("Sound is late", "sync earlier 20", "Video is ahead: pull the sound in 20 ms"),
-                ("Sound is early", "sync later 20", "Audio is ahead: push the sound back 20 ms"),
-                ("Reset", "sync reset", "Back to no correction")):
-            b = Gtk.Button(label=text)
-            b.set_tooltip_text(tip)
-            b.connect("clicked", self.on_sync, args)
-            btns.pack_start(b, True, True, 0)
-        outer.pack_start(btns, False, False, 0)
-        self.sync_value = Gtk.Label(xalign=0)
-        self.sync_value.set_margin_top(4)
-        outer.pack_start(self.sync_value, False, False, 0)
 
     def _label(self, text):
         l = Gtk.Label(xalign=0)
@@ -224,13 +198,6 @@ class Panel(Gtk.Window):
         self.on_delay_reset(None)
         self.hide()
         return True  # keep the object alive; the menu reopens it
-
-    def on_hold(self, *_):
-        cmd = "%s hold %s" % (TUXPLAY, "on" if self.hold.get_active() else "off")
-        run_command(lambda: sh(cmd), self.app.refresh)
-
-    def on_sync(self, _b, args):
-        run_command(lambda: sh("%s %s" % (TUXPLAY, args)), self.app.refresh)
 
     def on_delay_preview(self, scale):
         ms = int(scale.get_value())
@@ -307,19 +274,12 @@ class Panel(Gtk.Window):
             sw.set_active(bool(o["selected"]))
             sw.handler_unblock(h)
 
-        self.hold.handler_block(self.hold_handler)
-        self.hold.set_active(bool(s.get("hold")))
-        self.hold.handler_unblock(self.hold_handler)
-
-        delay, adv, sync = s.get("delay"), s.get("advertised"), s.get("sync")
+        delay, adv = s.get("delay"), s.get("advertised")
         if delay is not None:
             self.applied_delay, self.applied_adv = delay, adv
             if not self.dragging:
                 self.scale.set_value(min(900, max(150, delay)))
                 self.show_applied()
-        if sync is not None:
-            self.sync_value.set_markup('<span size="small" alpha="65%%">'
-                                       'correction %+d ms</span>' % sync)
 
     def on_device(self, sw, _p, oid):
         on = sw.get_active()
@@ -351,9 +311,6 @@ class Indicator:
         self.menu.append(self.item_devices)
         self.fetching = False
 
-        self.item_hold = Gtk.CheckMenuItem(label="Keep speakers ready")
-        self.hold_handler = self.item_hold.connect("toggled", self.on_hold)
-        self.menu.append(self.item_hold)
         self.menu.append(Gtk.SeparatorMenuItem())
 
         it = Gtk.MenuItem(label="Settings...")
@@ -377,10 +334,6 @@ class Indicator:
     def show_panel(self, *_):
         self.panel.show_all()
         self.panel.present()
-
-    def on_hold(self, item):
-        cmd = "%s hold %s" % (TUXPLAY, "on" if item.get_active() else "off")
-        run_command(lambda: sh(cmd), self.refresh)
 
     def on_device(self, item, oid):
         on = item.get_active()
@@ -450,9 +403,6 @@ class Indicator:
         self.item_status.set_label(bits)
 
         self.rebuild_devices(s.get("outputs", []))
-        self.item_hold.handler_block(self.hold_handler)
-        self.item_hold.set_active(bool(s.get("hold")))
-        self.item_hold.handler_unblock(self.hold_handler)
 
         if self.panel.get_visible():
             self.panel.update(s)

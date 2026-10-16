@@ -1,7 +1,7 @@
 [Unit]
-Description=Control panel for the HomePod pair output
-After=tuxplay-share.service
-Wants=tuxplay-share.service
+Description=Tuxplay control panel
+After=tuxplayd.service
+Wants=tuxplayd.service
 
 [Service]
 Type=simple

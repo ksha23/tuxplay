@@ -4,6 +4,12 @@ Working notes from building this - the protocol behaviour that is not written
 down anywhere obvious, what a Mac actually does when you measure it rather than
 assume, and the things that wasted a day so they do not waste another.
 
+- [tuxplayd-v2.md](tuxplayd-v2.md) - why v1 was replaced, what macOS 27 does on
+  the wire, how tuxplayd compares, and the bugs found bringing it up.
+
+The notes below come from v1, which sent through owntone-mini. Its protocol and
+PipeWire findings still hold. Its owntone and pipe-tunnel specifics are history.
+
 - [airplay2-protocol.md](airplay2-protocol.md) - transports, the anchor and its
   `rate` field, `RECORD`, stereo pairs, the event channel, and a table of
   everything ruled out about the white indicator.

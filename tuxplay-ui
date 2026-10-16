@@ -15,7 +15,6 @@ thing that can fail to install.
 import html
 import json
 import os
-import re
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,8 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BIND = os.environ.get("TUXPLAY_UI_BIND", "0.0.0.0")
 PORT = int(os.environ.get("TUXPLAY_UI_PORT", "8730"))
 API = os.environ.get("TUXPLAY_API", "http://localhost:3689")
-HOLD_CONF = os.path.expanduser("~/.config/tuxplay-hold.conf")
-# The AirPlay control connection owntone holds to each connected speaker.
+# The AirPlay control connection tuxplayd holds to each connected speaker.
 RTSP_PORT = int(os.environ.get("TUXPLAY_RTSP_PORT", "7000"))
 
 
@@ -38,33 +36,19 @@ def run(cmd, timeout=25):
 
 def state():
     # Only established connections: sockets still closing count as nothing.
-    # (Not filtered by process: owntone's socket owners are hidden from ss.)
     rc, out, _ = run("ss -tnH state established '( dport = :%d )' 2>/dev/null | wc -l"
                      % RTSP_PORT)
     sessions = int(out) if out.isdigit() else 0
 
-    rc, out, _ = run("/usr/local/bin/tuxplay status 2>/dev/null")
-    delay = sync = advertised = None
-    for line in out.splitlines():
-        m = re.search(r"delay you hear:\s+(\d+)", line)
-        if m:
-            delay = int(m.group(1))
-        m = re.search(r"sync correction:\s+([+-]?\d+)", line)
-        if m:
-            sync = int(m.group(1))
-        m = re.search(r"advertised to clients:\s+(\d+)", line)
-        if m:
-            advertised = int(m.group(1))
-
-    hold = False
+    delay = advertised = None
+    rc, out, _ = run("curl -s --max-time 4 %s/api/latency" % API)
     try:
-        with open(HOLD_CONF) as fh:
-            hold = "HOLD=1" in fh.read()
-    except OSError:
+        lat = json.loads(out)
+        delay, advertised = lat.get("ms"), lat.get("advertised_ms")
+    except Exception:
         pass
 
-    _, watcher, _ = run("systemctl --user is-active tuxplay-share")
-    _, server, _ = run("systemctl is-active owntone-mini")
+    _, watcher, _ = run("systemctl --user is-active tuxplayd")
 
     outputs, pair = [], None
     rc, out, _ = run("curl -s --max-time 4 %s/api/outputs" % API)
@@ -91,7 +75,7 @@ def state():
 
     names = ", ".join(o["name"] for o in chosen) or "nothing"
     if watcher != "active":
-        status, detail = "off", "The helper is stopped, so nothing is managing the outputs."
+        status, detail = "off", "tuxplayd is stopped, so nothing is managing the outputs."
     elif not outputs:
         status, detail = "missing", "No AirPlay devices have been discovered yet."
     elif not chosen:
@@ -103,8 +87,8 @@ def state():
     else:
         status, detail = "released", "%s selected, not connected yet." % names
 
-    return {"sessions": sessions, "delay": delay, "sync": sync, "advertised": advertised,
-            "hold": hold, "watcher": watcher, "server": server, "pair": pair,
+    return {"sessions": sessions, "delay": delay, "advertised": advertised,
+            "watcher": watcher, "pair": pair,
             "outputs": outputs, "silent_msec": silent, "status": status, "detail": detail}
 
 
@@ -174,9 +158,9 @@ hr{border:none;border-top:1px solid var(--line);margin:18px 0}
     <div><span class=pill><span class="dot" id=dot></span><span id=statustext>&mdash;</span></span></div>
     <button class=sw id=master role=switch aria-checked=false title="Master switch"></button>
   </div>
-  <div class=desc>Turning this off stops managing the speakers entirely and hands
-  them back to whatever else wants them. Nothing else on this page applies while
-  it is off.</div>
+  <div class=desc>Turning this off stops tuxplayd: the speakers are released and
+  the Tuxplay output leaves the desktop's sound panel until it is turned back on.
+  Nothing else on this page applies while it is off.</div>
   <div class=facts>
     <span>Connections to the speakers</span><b id=sessions>&mdash;</b>
     <span>Selected output</span><b id=selected>&mdash;</b>
@@ -188,23 +172,12 @@ hr{border:none;border-top:1px solid var(--line);margin:18px 0}
   <div class=desc>Any AirPlay 2 device on the network, and as many at once as you
   like. A stereo pair appears once, as a single output; selecting it drives both
   speakers together.<br><br>These are chosen here, not in the desktop's sound
-  panel. There the only entry from this project is <b>AirPlay 2 Output</b>; the
-  other AirPlay names you see there are PipeWire's own AirPlay 1 sinks, which
-  address one speaker each and cannot drive a pair.</div>
+  panel, where this project is the single entry <b>Tuxplay (AirPlay 2)</b>.<br><br>
+  Another device can take the speakers whenever it wants them. Tuxplay then
+  leaves them alone until something new plays here.</div>
   <div id=outputs style="margin-top:14px"></div>
 </div>
 
-<div class=card id=holdcard>
-  <div class=row>
-    <div class=lbl>Keep the speakers ready</div>
-    <button class=sw id=hold role=switch aria-checked=false></button>
-  </div>
-  <div class=desc><b>On:</b> the connection stays open, so playback starts
-  immediately. The speakers still go dark when nothing is playing, and another
-  device can take them whenever it asks.<br><b>Off:</b> the connection is dropped
-  a couple of seconds after audio stops, so the next play has to set the session
-  up again and takes about a second and a half to start.</div>
-</div>
 
 <div class=card id=delaycard>
   <div class=row><div class=lbl>Delay</div><div><input class=num id=delaynum
@@ -217,26 +190,13 @@ hr{border:none;border-top:1px solid var(--line);margin:18px 0}
     <button class="act primary" id=delayapply disabled>Apply delay</button>
     <button class=act id=delayreset disabled>Cancel</button>
   </div>
-  <div class=note>Applying restarts the audio server and PipeWire, which can
-  interrupt whatever is playing. Do it while nothing is playing.</div>
+  <div class=note>Takes effect at once: what is playing pauses for a moment.
+  Players are told the new delay, so picture and sound stay together.</div>
+  <div class=facts>
+    <span>Told to players</span><b id=advertised>&mdash;</b>
+  </div>
 </div>
 
-<div class=card id=synccard>
-  <div class=row><div class=lbl>Picture and sound</div>
-    <div><b id=syncval style="font-family:ui-monospace,Menlo,monospace">&mdash;</b></div></div>
-  <div class=desc>If they disagree, nudge in the direction you see. Safe to use
-  while watching something: it does not interrupt playback.</div>
-  <div class=pair>
-    <button class=act data-sync="earlier">Sound is late</button>
-    <button class=act data-sync="later">Sound is early</button>
-    <button class=act data-sync="reset">Reset</button>
-  </div>
-  <hr>
-  <div class=facts>
-    <span>Advertised to players</span><b id=advertised>&mdash;</b>
-    <span>Audio server</span><b id=server>&mdash;</b>
-  </div>
-</div>
 
 </div><script>
 let dirty=false, busy=false;
@@ -256,9 +216,7 @@ async function refresh(){
  $('sessions').textContent=s.sessions;
  $('selected').textContent=s.pair?(s.pair.selected?s.pair.name:'none'):'—';
  $('advertised').textContent=s.advertised!=null?s.advertised+' ms':'—';
- $('server').textContent=s.server;
  setsw($('master'),s.watcher==='active');
- setsw($('hold'),s.hold,s.watcher!=='active');
  const box=$('outputs'); const want=(s.outputs||[]).map(o=>o.id+':'+o.selected).join(',');
  if(box.dataset.sig!==want){box.dataset.sig=want;box.innerHTML='';
   for(const o of (s.outputs||[])){
@@ -271,8 +229,6 @@ async function refresh(){
    b.setAttribute('aria-checked',o.selected?'true':'false');
    b.onclick=()=>api('/api/output',{id:o.id,on:b.getAttribute('aria-checked')!=='true'});
    row.append(l,b);box.append(row);}}
- $('syncval').textContent=(s.sync>0?'+':'')+(s.sync==null?'—':s.sync+' ms');
- for(const b of document.querySelectorAll('[data-sync]'))b.disabled=s.watcher!=='active';
  if(!dirty&&s.delay!=null){$('delaynum').value=s.delay;$('delayrange').value=Math.min(1200,s.delay)}
 }
 function markdirty(){dirty=true;$('delayapply').disabled=false;$('delayreset').disabled=false}
@@ -285,9 +241,6 @@ $('delayapply').onclick=async()=>{const v=+$('delaynum').value;
  dirty=false;$('delayapply').disabled=true;$('delayreset').disabled=true;
  await api('/api/delay',{ms:v})};
 $('master').onclick=()=>api('/api/master',{on:$('master').getAttribute('aria-checked')!=='true'});
-$('hold').onclick=()=>api('/api/hold',{on:$('hold').getAttribute('aria-checked')!=='true'});
-for(const b of document.querySelectorAll('[data-sync]'))
- b.onclick=()=>api('/api/sync',{dir:b.dataset.sync,ms:20});
 refresh();setInterval(refresh,2500);
 </script></body></html>"""
 
@@ -322,23 +275,8 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             body = {}
 
-        if self.path == "/api/hold":
-            run("/usr/local/bin/tuxplay hold %s" % ("on" if body.get("on") else "off"))
-        elif self.path == "/api/master":
-            if body.get("on"):
-                run("systemctl --user start tuxplay-share")
-            else:
-                run("systemctl --user stop tuxplay-share")
-                # Hand the speakers back rather than leaving them held by a
-                # helper that is no longer running.
-                rc, out, _ = run("curl -s --max-time 4 %s/api/outputs" % API)
-                try:
-                    for o in json.loads(out).get("outputs", []):
-                        if "Stereo" in o.get("name", ""):
-                            run("curl -s --max-time 6 -X PUT -H 'Content-Type: application/json'"
-                                " -d '{\"selected\":false}' %s/api/outputs/%s" % (API, o["id"]))
-                except Exception:
-                    pass
+        if self.path == "/api/master":
+            run("systemctl --user %s tuxplayd" % ("start" if body.get("on") else "stop"))
         elif self.path == "/api/output":
             oid = str(body.get("id") or "")
             want = "true" if body.get("on") else "false"
@@ -348,14 +286,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/delay":
             ms = int(body.get("ms") or 0)
             if 150 <= ms <= 3500:
-                run("/usr/local/bin/tuxplay %d" % ms, timeout=90)
-        elif self.path == "/api/sync":
-            d = body.get("dir")
-            if d == "reset":
-                run("/usr/local/bin/tuxplay sync reset", timeout=90)
-            elif d in ("earlier", "later"):
-                run("/usr/local/bin/tuxplay sync %s %d" % (d, int(body.get("ms") or 20)),
-                    timeout=90)
+                run("curl -s --max-time 8 -X PUT -H 'Content-Type: application/json'"
+                    " -d '{\"ms\":%d}' %s/api/latency" % (ms, API))
         else:
             self._send(404, "not found", "text/plain")
             return

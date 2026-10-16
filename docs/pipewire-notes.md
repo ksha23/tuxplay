@@ -32,6 +32,13 @@ value clients read is on the **input ports**:
 port playback_FL  ->  direction Input: minNs = 465000000
 ```
 
+A sink built on `pw_stream` (tuxplayd's) declares it with a port
+`SPA_PARAM_Latency`, direction `SPA_DIRECTION_INPUT`, through
+`pw_stream_update_params()`. `SPA_PARAM_ProcessLatency` is silently dropped by the
+adapter in front of the stream (PipeWire 1.0.7, measured): tuxplayd first declared
+it that way, every port stayed at 0, and players ran the picture a full delay
+early. The port value propagates to every client stream linked to the sink.
+
 And `pactl list sinks` reporting `Latency: 0 usec` means the *measured* latency of
 an idle sink, not the declared one. PipeWire's own RAOP sinks report the same.
 Checking the wrong object here produced a completely wrong conclusion that stood
